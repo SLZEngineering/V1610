@@ -2,9 +2,9 @@
 set -Eeuo pipefail
 
 ###############################################################################
-# Script: rswsolutionz_domotz_setup_rev5091126-V1610-LAB5.sh
+# Script: rswsolutionz_domotz_setup_rev5091126-V1610-LAB2.sh
 # Company: Solutionz INC / RSW
-# Revision: 5091126-V1610-LAB5
+# Revision: 5091126-V1610-LAB2
 # Release Date: 2026-09-11
 #
 # Purpose:
@@ -32,8 +32,8 @@ set -Eeuo pipefail
 #     match is diagnostic only and is not a production failure criterion.
 ###############################################################################
 
-REVISION="5091126-V1610-LAB5"
-SCRIPT_NAME="rswsolutionz_domotz_setup_rev5091126-V1610-LAB5.sh"
+REVISION="5091126-V1610-LAB2"
+SCRIPT_NAME="rswsolutionz_domotz_setup_rev5091126-V1610-LAB2.sh"
 RELEASE_DATE="2026-09-11"
 
 SUPPORTED_OS_ID="ubuntu"
@@ -142,7 +142,7 @@ REQUIRED_PACKAGES=(
 #   must still permit the required traffic described below.
 # - Required outbound TCP: 443, 5671, 32700-57699, 4505-4506, 55022, 11371.
 # - Required/expected UDP: 53 for DNS when UDP transport is used; 123 for NTP;
-#   67/68 for DHCP when eth0 obtains addressing by DHCP; and UDP 161 from the RMM
+#   67/68 for DHCP when eno0 obtains addressing by DHCP; and UDP 161 from the RMM
 #   Agent to monitored devices when SNMP polling is configured.
 # - DNS may also use TCP 53 for fallback/large responses.
 # - Additional TCP/UDP ports may be required by specific monitored AV devices or
@@ -155,7 +155,7 @@ Usage:
 
 Options:
   --non-interactive             Skip the two manual confirmation prompts.
-  --easter-egg                  Display the non-operational 5091126-V1610-LAB5 Easter egg and exit.
+  --easter-egg                  Display the non-operational 5091126-V1610-LAB2 Easter egg and exit.
   -h, --help                    Show this help.
 
 Domotz update model:
@@ -168,7 +168,7 @@ show_easter_egg() {
   printf '%s\n' "${COLOR_CYAN}"
   cat <<'EASTER_EGG'
 ╔══════════════════════════════════════════════════════╗
-║              SOLUTIONZ RMM - REV 5091126-V1610-LAB5            ║
+║              SOLUTIONZ RMM - REV 5091126-V1610-LAB2            ║
 ║                                                      ║
 ║  If you found this, you actually read the script.   ║
 ║  Statistically, that already puts you ahead.        ║
@@ -264,7 +264,7 @@ backup_previous_state() {
 
 record_network_requirements() {
   cat > "${NETWORK_REQUIREMENTS_FILE}" <<'EOF'
-Solutionz RMM Agent Network Requirements - Revision 5091126-V1610-LAB5
+Solutionz RMM Agent Network Requirements - Revision 5091126-V1610-LAB2
 
 Traffic model
 - Monitoring traffic originates from the RMM Agent to monitored AV devices.
@@ -284,7 +284,7 @@ Outbound TCP - cloud/platform
 Outbound/local UDP
 - UDP 53           DNS queries when the resolver uses UDP transport
 - UDP 123          NTP/time synchronization
-- UDP 67/68        DHCP client/server exchange when eth0 is configured for DHCP
+- UDP 67/68        DHCP client/server exchange when eno0 is configured for DHCP
 - UDP 161          SNMP polling from the RMM Agent to monitored devices when SNMP
                    monitoring is configured
 - Additional UDP   As required by a specific monitored-device manufacturer protocol
@@ -386,7 +386,7 @@ This script will:
   3. Install only missing required packages; no general apt upgrade is performed.
   4. Verify SSH, TUN, Snap, Domotz, and required Domotz permissions.
   5. Configure UFW with inbound TCP 22/TCP 3000 permitted and default-allow outbound TCP/UDP traffic.
-  6. Stage Netplan with eth0 as the RMM network interface and eth1-eth5 reserved.
+  6. Stage Netplan with eno0 as the RMM network interface and eno1-eno5 reserved.
   7. Repair and validate system DNS behavior.
   8. Normalize Solutionz hostname entries.
   9. Configure GRUB interface naming and the V1610 USB-C COM serial console.
@@ -525,19 +525,21 @@ preflight_checks() {
   local default_iface default_gateway current_cidr
   default_iface="$(ip -4 route show default | awk 'NR==1 {print $5}')"
   default_gateway="$(ip -4 route show default | awk 'NR==1 {print $3}')"
-  [[ -n "${default_iface}" && $(basename "$(readlink -f "/sys/class/net/${default_iface}/device")") == 0000:03:00.0 ]] || error_exit "Expected default route on PCI 0000:03:00.0 (future eth0); detected ${default_iface:-none}."
+  [[ "${default_iface}" == eno0 ]] || error_exit "Expected current default route on eno0; detected ${default_iface:-none}."
   current_cidr="$(ip -o -4 addr show dev "${default_iface}" scope global | awk 'NR==1 {print $4}')"
   [[ -n "${current_cidr}" ]] || error_exit "Default-route interface ${default_iface} has no global IPv4 address."
   progress_message "Network preflight: ${default_iface} ${current_cidr}, gateway ${default_gateway:-not-reported}."
 
+  dns_resolves_ipv4 archive.ubuntu.com || error_exit "DNS cannot resolve archive.ubuntu.com to IPv4."
   dns_resolves_ipv4 api.snapcraft.io || error_exit "DNS cannot resolve api.snapcraft.io to IPv4."
+  dns_resolves_ipv4 security.ubuntu.com || error_exit "DNS cannot resolve security.ubuntu.com to IPv4."
 
-  # Validate Snap over IPv4 with retries; APT tests its configured sources
-  # in install_required_packages when package bootstrap is actually needed.
-  curl -4 -fsSL --connect-timeout 10 --max-time 30 --retry 3 \
-    -o /dev/null https://api.snapcraft.io/ || \
-    error_exit "IPv4 HTTPS connectivity to api.snapcraft.io failed."
-  progress_message "Snap HTTPS connectivity verified; configured APT repositories will be checked if packages are missing."
+  timeout 8 bash -c '</dev/tcp/archive.ubuntu.com/80' || \
+    error_exit "Cannot establish TCP connectivity to archive.ubuntu.com:80 for package bootstrap."
+  timeout 8 bash -c '</dev/tcp/api.snapcraft.io/443' || \
+    error_exit "Cannot establish TCP connectivity to api.snapcraft.io:443."
+  timeout 8 bash -c '</dev/tcp/security.ubuntu.com/443' || \
+    warning_message "TCP 443 to security.ubuntu.com could not be confirmed; apt source configuration may use another transport/mirror."
 
   if command -v timedatectl >/dev/null 2>&1; then
     local synced
@@ -714,18 +716,18 @@ install_required_packages() {
   else
     warning_message "${#missing_packages[@]} required package(s) are missing from the manufacturer baseline: ${missing_packages[*]}"
     progress_message "Updating package indexes only because required packages are missing..."
-    if ! apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -o APT::Update::Error-Mode=any update; then
+    if ! apt-get update; then
       error_exit "apt-get update failed. Review ${LOG_FILE} for repository, DNS, or network errors."
     fi
     progress_message "Package index update completed successfully."
 
     progress_message "Installing only the missing approved package(s)..."
     local install_plan
-    install_plan=$(apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 -s install --no-install-recommends "${missing_packages[@]}") || error_exit "Package simulation failed."
+    install_plan=$(apt-get -s install --no-install-recommends "${missing_packages[@]}") || error_exit "Package simulation failed."
     if grep -Eq '^Inst base-files([ :]|$)' <<< "$install_plan"; then
       error_exit "Dependency installation would change base-files and may advance the point release. Use a controlled lab repository."
     fi
-    if ! apt-get -o Acquire::ForceIPv4=true -o Acquire::Retries=3 install -y --no-install-recommends "${missing_packages[@]}"; then
+    if ! apt-get install -y --no-install-recommends "${missing_packages[@]}"; then
       error_exit "Required package installation failed. Review ${LOG_FILE} for the package that failed and the apt/dpkg error."
     fi
     progress_message "Missing required package installation completed successfully."
@@ -775,7 +777,7 @@ configure_time_sync() {
   systemctl list-unit-files systemd-timesyncd.service >/dev/null 2>&1 || \
     error_exit "systemd-timesyncd.service is unavailable; the required systemd-timesyncd package is not installed correctly."
 
-  # Revision 5091126-V1610-LAB5 standardizes Ubuntu time synchronization on
+  # Revision 5091126-V1610-LAB2 standardizes Ubuntu time synchronization on
   # systemd-timesyncd. timedatectl enables network time, while the explicit
   # service commands make the runtime/startup state deterministic.
   timedatectl set-ntp true >/dev/null 2>&1 || \
@@ -903,160 +905,42 @@ configure_ufw() {
   ufw status verbose
 }
 
-install_v1610_nic_naming() {
-  progress_message "Stage deterministic eth0-eth5 naming for next boot (no live rename)."
-  local backup
-  backup=$(mktemp -d "${STATE_DIR}/pre-nic-naming.XXXXXX")
-  cp -a /etc/netplan "$backup/netplan"
-  if [[ -e /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg ]]; then
-    cp -a /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg "$backup/"
-  fi
-  printf '%s\n' "$backup" > "${STATE_DIR}/nic-naming-backup-${REVISION}.txt"
-  # This V5 lab build uses systemd-networkd exclusively.
-  if systemctl is-active --quiet NetworkManager.service; then error_exit "NetworkManager active; use the supported networkd baseline."; fi
-  systemctl is-enabled --quiet systemd-networkd.service || error_exit "systemd-networkd must be enabled before staging NIC naming."
-  cat > /usr/local/sbin/solutionz-v1610-nic-naming <<'NICNAMING'
-#!/usr/bin/env bash
-set -Eeuo pipefail
-# V1610 PCI-slot-to-eth mapping. Missing secondary NICs never block WAN startup.
-# Hardware inventory failure is reported separately by Phase 2 validation.
-slots=(03 04 05 07 08 09)
-declare -a names macs available
-missing=0
-bad=0
-declare -A seen=()
-shopt -s nullglob
-for i in "${!slots[@]}"; do
-  pci="/sys/bus/pci/devices/0000:${slots[i]}:00.0"
-  links=("$pci"/net/*)
-  if [[ ${#links[@]} != 1 || ! -r "$pci/vendor" || ! -r "$pci/device" || \
-        $(cat "$pci/vendor" 2>/dev/null) != 0x8086 || \
-        $(cat "$pci/device" 2>/dev/null) != 0x125c || \
-        $(basename "$(readlink -f "$pci/driver")") != igc ]]; then
-    echo "WARN - Missing or invalid PCI NIC at ${slots[i]}:00.0 (expected eth$i)" >&2
-    missing=$((missing+1))
-    continue
-  fi
-  names[i]=${links[0]##*/}
-  macs[i]=$(cat "/sys/class/net/${names[i]}/address")
-  if [[ ! ${macs[i]} =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ || \
-        ${macs[i]} == 00:00:00:00:00:00 || -n ${seen[${macs[i]}]:-} ]]; then
-    echo "ERROR - Invalid or duplicate MAC for PCI ${slots[i]}:00.0" >&2
-    bad=$((bad+1))
-    continue
-  fi
-  seen[${macs[i]}]=1
-  available+=("$i")
-  printf '%s -> eth%s | PCI %s | %s\n' "${names[i]}" "$i" "${slots[i]}" "${macs[i]}"
-done
-if [[ ${1:-} == --check ]]; then
-  [[ $missing == 0 && $bad == 0 && ${#available[@]} == 6 ]] || exit 1
-  exit 0
-fi
-# Do not risk a live rename after the network stack is in use.
-if systemctl is-active --quiet systemd-networkd.service || systemctl is-active --quiet NetworkManager.service; then
-  echo 'ERROR - Refusing live NIC rename while network management is active.' >&2
-  exit 1
-fi
-# A failed secondary NIC must never prevent the surviving WAN NIC from being named.
-# Check for collisions before touching ANY interface.
-for i in "${available[@]}"; do
-  [[ ! -e /sys/class/net/rmmstage$i ]] || { echo "ERROR - Temporary name collision rmmstage$i" >&2; exit 1; }
-  if [[ -e /sys/class/net/eth$i ]]; then
-    owns=0
-    for j in "${available[@]}"; do
-      [[ ${names[j]} != eth$i ]] || owns=1
-    done
-    [[ $owns == 1 ]] || { echo "ERROR - Destination collision eth$i" >&2; exit 1; }
-  fi
-done
-# Stage only interfaces needing renaming and vacate target names before assignment.
-changes=0
-for i in "${available[@]}"; do
-  [[ ${names[i]} == eth$i ]] || changes=1
-done
-if [[ $changes == 1 ]]; then
-  for i in "${available[@]}"; do
-    ip link set dev "${names[i]}" down
-    ip link set dev "${names[i]}" name "rmmstage$i"
-  done
-  for i in "${available[@]}"; do
-    ip link set dev "rmmstage$i" name "eth$i"
-  done
-fi
-for i in "${available[@]}"; do
-  [[ $(basename "$(readlink -f "/sys/class/net/eth$i/device")") == "0000:${slots[i]}:00.0" && \
-     $(cat "/sys/class/net/eth$i/address") == "${macs[i]}" ]] || \
-     { echo "ERROR - Final mapping mismatch for eth$i" >&2; exit 1; }
-done
-if ((missing > 0 || bad > 0)); then
-  echo "WARN - Incomplete V1610 hardware inventory: ${#available[@]} of six NICs. Network startup continues; hardware acceptance must FAIL." >&2
-fi
-NICNAMING
-  chmod 750 /usr/local/sbin/solutionz-v1610-nic-naming
-  chown root:root /usr/local/sbin/solutionz-v1610-nic-naming
-  /usr/local/sbin/solutionz-v1610-nic-naming --check || error_exit "NIC naming inventory check failed."
-  cat > /etc/systemd/system/solutionz-v1610-nic-naming.service <<'NICUNIT'
-[Unit]
-Description=Solutionz V1610 deterministic PCI Ethernet naming
-DefaultDependencies=no
-Wants=systemd-udev-settle.service network-pre.target
-After=local-fs.target systemd-udev-settle.service
-Before=network-pre.target systemd-networkd.service NetworkManager.service shutdown.target
-Conflicts=shutdown.target
-
-[Service]
-Type=oneshot
-ExecStart=/usr/local/sbin/solutionz-v1610-nic-naming
-RemainAfterExit=yes
-TimeoutStartSec=45
-NICUNIT
-  mkdir -p /etc/systemd/system/systemd-networkd.service.d
-  cat > /etc/systemd/system/systemd-networkd.service.d/20-solutionz-v1610-nic-naming.conf <<'NICDROPIN'
-[Unit]
-Wants=solutionz-v1610-nic-naming.service
-After=solutionz-v1610-nic-naming.service
-NICDROPIN
-  systemctl daemon-reload
-  progress_message "NIC naming service staged (non-blocking on missing NICs); backup: $backup. Reboot only with working local or serial console access."
-}
-
 write_netplan_config() {
   cat > "${NETPLAN_FILE}" <<'YAML'
 network:
   version: 2
   renderer: networkd
   ethernets:
-    eth0:
+    eno0:
       dhcp4: true
       dhcp6: false
       accept-ra: false
 
-    eth1:
+    eno1:
       dhcp4: false
       dhcp6: false
       accept-ra: false
       link-local: []
       optional: true
-    eth2:
+    eno2:
       dhcp4: false
       dhcp6: false
       accept-ra: false
       link-local: []
       optional: true
-    eth3:
+    eno3:
       dhcp4: false
       dhcp6: false
       accept-ra: false
       link-local: []
       optional: true
-    eth4:
+    eno4:
       dhcp4: false
       dhcp6: false
       accept-ra: false
       link-local: []
       optional: true
-    eth5:
+    eno5:
       dhcp4: false
       dhcp6: false
       accept-ra: false
@@ -1070,9 +954,6 @@ remove_stale_cloud_init_netplans() {
   shopt -s nullglob
   local files=(/etc/netplan/50-cloud-init*)
   if (( ${#files[@]} > 0 )); then
-    local archive
-    archive=$(mktemp -d "${STATE_DIR}/cloud-netplan-backup.XXXXXX")
-    cp -a "${files[@]}" "$archive/"
     rm -f "${files[@]}"
     progress_message "Removed stale cloud-init Netplan files."
   fi
@@ -1195,7 +1076,7 @@ configure_grub_and_serial() {
 
   cp -a "${GRUB_FILE}" "${GRUB_FILE}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
 
-  # Keep predictable early-boot names; the dedicated PCI naming service assigns eth0-eth5 before networkd.
+  # Keep firmware-provided predictable interface names on V1610.
   append_grub_param "GRUB_CMDLINE_LINUX_DEFAULT" "console=tty0"
   append_grub_param "GRUB_CMDLINE_LINUX_DEFAULT" "console=ttyS0,115200n8"
 
@@ -1271,35 +1152,35 @@ network:
   version: 2
   renderer: networkd
   ethernets:
-    eth0:
+    eno0:
       dhcp4: true
       dhcp6: false
       accept-ra: false
-    eth1:
+    eno1:
       dhcp4: false
       dhcp6: false
       accept-ra: false
       link-local: []
       optional: true
-    eth2:
+    eno2:
       dhcp4: false
       dhcp6: false
       accept-ra: false
       link-local: []
       optional: true
-    eth3:
+    eno3:
       dhcp4: false
       dhcp6: false
       accept-ra: false
       link-local: []
       optional: true
-    eth4:
+    eno4:
       dhcp4: false
       dhcp6: false
       accept-ra: false
       link-local: []
       optional: true
-    eth5:
+    eno5:
       dhcp4: false
       dhcp6: false
       accept-ra: false
@@ -1313,7 +1194,7 @@ write_static() {
   local address gateway dns_input
   local -a dns_servers
 
-  read -r -p "eth0 IPv4 address with CIDR (example 192.168.10.20/24): " address
+  read -r -p "eno0 IPv4 address with CIDR (example 192.168.10.20/24): " address
   validate_ipv4_cidr "${address}" || { echo "Invalid IPv4/CIDR."; return 1; }
 
   read -r -p "Default gateway IPv4 address: " gateway
@@ -1341,7 +1222,7 @@ network:
   version: 2
   renderer: networkd
   ethernets:
-    eth0:
+    eno0:
       dhcp4: false
       dhcp6: false
       accept-ra: false
@@ -1360,31 +1241,31 @@ YAML
   fi
 
   cat >> "${NETPLAN_FILE}" <<'YAML'
-    eth1:
+    eno1:
       dhcp4: false
       dhcp6: false
       accept-ra: false
       link-local: []
       optional: true
-    eth2:
+    eno2:
       dhcp4: false
       dhcp6: false
       accept-ra: false
       link-local: []
       optional: true
-    eth3:
+    eno3:
       dhcp4: false
       dhcp6: false
       accept-ra: false
       link-local: []
       optional: true
-    eth4:
+    eno4:
       dhcp4: false
       dhcp6: false
       accept-ra: false
       link-local: []
       optional: true
-    eth5:
+    eno5:
       dhcp4: false
       dhcp6: false
       accept-ra: false
@@ -1411,8 +1292,8 @@ show_status() {
   echo
 }
 
-sync_ufw_to_eth0_subnet() {
-  # Revision 5091126-V1610-LAB5 production policy keeps TCP 22 and TCP 3000 globally
+sync_ufw_to_eno0_subnet() {
+  # Revision 5091126-V1610-LAB2 production policy keeps TCP 22 and TCP 3000 globally
   # permitted in UFW. Network changes therefore do not require source-subnet
   # firewall rewrites.
   return 0
@@ -1432,7 +1313,7 @@ apply_config() {
 
   netplan apply
   sleep 2
-  sync_ufw_to_eth0_subnet
+  sync_ufw_to_eno0_subnet
   show_status
 }
 
@@ -1450,17 +1331,14 @@ restore_backup() {
 }
 
 require_root
-for i in {0..5}; do
-  [[ -e /sys/class/net/eth$i ]] || { echo "Reboot and verify NIC naming before using this menu." >&2; exit 1; }
-done
 
 while true; do
   cat <<'MENU'
 
 Solutionz RMM V1610 USB-C COM Local Configuration
 -------------------------------------------------
-1) Configure eth0 for DHCP
-2) Configure eth0 with a static IPv4 address
+1) Configure eno0 for DHCP
+2) Configure eno0 with a static IPv4 address
 3) Show current network status
 4) Restore most recent serial-console Netplan backup
 5) Exit
@@ -1548,7 +1426,7 @@ install_postreboot_validation() {
 #!/usr/bin/env bash
 set -uo pipefail
 
-REVISION="5091126-V1610-LAB5"
+REVISION="5091126-V1610-LAB2"
 SUPPORTED_OS_ID="ubuntu"
 SUPPORTED_UBUNTU_VERSION_ID="24.04"
 SUPPORTED_UBUNTU_CODENAME="noble"
@@ -1556,14 +1434,14 @@ SUPPORTED_VENDOR="Protectli"
 SUPPORTED_MODEL="V1610"
 
 STATE_FILE="/var/lib/rswsolutionz-rmm/install.state"
-PACKAGE_BASELINE_FILE="/var/lib/rswsolutionz-rmm/package-baseline-5091126-V1610-LAB5.tsv"
-OS_BASELINE_FILE="/var/lib/rswsolutionz-rmm/os-baseline-5091126-V1610-LAB5.txt"
-MANUFACTURER_BASELINE_FILE="/var/lib/rswsolutionz-rmm/manufacturer-baseline-5091126-V1610-LAB5.txt"
-MANUFACTURER_PACKAGE_BASELINE_FILE="/var/lib/rswsolutionz-rmm/manufacturer-packages-5091126-V1610-LAB5.tsv"
-MANUFACTURER_PACKAGE_VALIDATION_FILE="/var/lib/rswsolutionz-rmm/manufacturer-package-validation-5091126-V1610-LAB5.txt"
-MANUFACTURER_BASELINE_SHA256_FILE="/var/lib/rswsolutionz-rmm/manufacturer-baseline-5091126-V1610-LAB5.sha256"
-SNAP_BASELINE_FILE="/var/lib/rswsolutionz-rmm/snap-baseline-5091126-V1610-LAB5.txt"
-NETWORK_REQUIREMENTS_FILE="/var/lib/rswsolutionz-rmm/network-requirements-5091126-V1610-LAB5.txt"
+PACKAGE_BASELINE_FILE="/var/lib/rswsolutionz-rmm/package-baseline-5091126-V1610-LAB2.tsv"
+OS_BASELINE_FILE="/var/lib/rswsolutionz-rmm/os-baseline-5091126-V1610-LAB2.txt"
+MANUFACTURER_BASELINE_FILE="/var/lib/rswsolutionz-rmm/manufacturer-baseline-5091126-V1610-LAB2.txt"
+MANUFACTURER_PACKAGE_BASELINE_FILE="/var/lib/rswsolutionz-rmm/manufacturer-packages-5091126-V1610-LAB2.tsv"
+MANUFACTURER_PACKAGE_VALIDATION_FILE="/var/lib/rswsolutionz-rmm/manufacturer-package-validation-5091126-V1610-LAB2.txt"
+MANUFACTURER_BASELINE_SHA256_FILE="/var/lib/rswsolutionz-rmm/manufacturer-baseline-5091126-V1610-LAB2.sha256"
+SNAP_BASELINE_FILE="/var/lib/rswsolutionz-rmm/snap-baseline-5091126-V1610-LAB2.txt"
+NETWORK_REQUIREMENTS_FILE="/var/lib/rswsolutionz-rmm/network-requirements-5091126-V1610-LAB2.txt"
 LOG_DIR="/var/log/solutionz-rmm/setup"
 LOG_FILE="${LOG_DIR}/postreboot-validation.log"
 DOMOTZ_SNAP_NAME="domotzpro-agent-publicstore"
@@ -1731,7 +1609,7 @@ validate_v1610_nics() (
   done
   [[ $count == 6 ]] || { echo "Expected six PCI Ethernet controllers; found $count" >&2; exit 1; }
   for i in "${!slots[@]}"; do
-    iface="eth$i"; dev="/sys/class/net/$iface/device"
+    iface="eno$i"; dev="/sys/class/net/$iface/device"
     [[ $(basename "$(readlink -f "$dev")") == "0000:${slots[i]}:00.0" && $(cat "$dev/vendor") == 0x8086 && $(cat "$dev/device") == 0x125c && $(basename "$(readlink -f "$dev/driver")") == igc ]] || { echo "Invalid PCI/controller/driver mapping for $iface" >&2; exit 1; }
     mac=$(cat "/sys/class/net/$iface/address") || exit 1
     [[ $mac =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ && $mac != 00:00:00:00:00:00 && -z ${seen[$mac]:-} ]] || exit 1
@@ -1741,12 +1619,11 @@ validate_v1610_nics() (
 )
 
 # Network baseline
-check "Deterministic NIC naming service completed" systemctl is-active --quiet solutionz-v1610-nic-naming.service
 check "V1610 PCI topology and igc drivers" validate_v1610_nics
-check "eth0 exists" ip link show eth0
-if ip -4 addr show dev eth0 2>/dev/null | grep -q 'inet '; then pass "eth0 has an IPv4 address."; else fail "eth0 has no IPv4 address."; fi
-if ip -4 route show default | grep -q ' dev eth0 '; then pass "Default IPv4 route uses eth0."; else fail "Default IPv4 route does not use eth0."; fi
-for iface in eth1 eth2 eth3 eth4 eth5; do
+check "eno0 exists" ip link show eno0
+if ip -4 addr show dev eno0 2>/dev/null | grep -q 'inet '; then pass "eno0 has an IPv4 address."; else fail "eno0 has no IPv4 address."; fi
+if ip -4 route show default | grep -q ' dev eno0 '; then pass "Default IPv4 route uses eno0."; else fail "Default IPv4 route does not use eno0."; fi
+for iface in eno1 eno2 eno3 eno4 eno5; do
   check "$iface exists" ip link show "$iface"
   if ip -4 route show default | grep -Eq " dev $iface( |$)"; then fail "$iface has an IPv4 default route."; else pass "$iface has no IPv4 default route."; fi
 done
@@ -1817,7 +1694,7 @@ check "Serial console service is enabled" systemctl is-enabled --quiet "${SERIAL
 # unit may respawn around login/session changes; enabled+active unit state,
 # ttyS0 presence, and GRUB console configuration are the production criteria.
 [[ -x "${LOCAL_CONFIG_TOOL}" ]] && pass "USB-C COM local configuration utility is installed." || fail "USB-C COM local configuration utility is missing."
-if grep -Eq '(^|[[:space:]"])(net\.ifnames=0|biosdevname=0)([[:space:]"]|$)' /proc/cmdline; then fail "Legacy interface naming is active."; else pass "Early-boot predictable naming retained; PCI naming service assigns eth0-eth5."; fi
+if grep -Eq '(^|[[:space:]"])(net\.ifnames=0|biosdevname=0)([[:space:]"]|$)' /proc/cmdline; then fail "Legacy interface naming is active."; else pass "Predictable interface naming retained."; fi
 if grep -Eq '^GRUB_CMDLINE_LINUX_DEFAULT=.*console=ttyS0,115200n8' "${GRUB_FILE}"; then pass "GRUB serial-console parameter is present."; else fail "GRUB serial-console parameter is missing."; fi
 
 echo "------------------------------------------------------------"
@@ -1933,8 +1810,6 @@ final_summary_check() {
   fi
   check_final_requirement "Final required-package baseline record exists" test -s "${BASELINE_FILE}" || failures=$((failures + 1))
   check_final_requirement "Network requirements record exists" test -s "${NETWORK_REQUIREMENTS_FILE}" || failures=$((failures + 1))
-  check_final_requirement "NIC naming helper syntax" bash -n /usr/local/sbin/solutionz-v1610-nic-naming || failures=$((failures + 1))
-  check_final_requirement "NIC naming inventory" /usr/local/sbin/solutionz-v1610-nic-naming --check || failures=$((failures + 1))
   check_final_requirement "Netplan generates successfully" netplan generate || failures=$((failures + 1))
   check_final_requirement "Domotz installed" snap list "${DOMOTZ_SNAP_NAME}" || failures=$((failures + 1))
   check_final_requirement "Post-reboot production validator installed" test -x "${POSTREBOOT_VALIDATOR}" || failures=$((failures + 1))
@@ -1963,7 +1838,6 @@ final_summary_check() {
 
 validate_v1610_nics() (
   local i dev iface mac driver count=0
-  local -a links
   local -a slots=(03 04 05 07 08 09)
   local -A seen=()
   for dev in /sys/bus/pci/devices/*; do
@@ -1971,14 +1845,12 @@ validate_v1610_nics() (
   done
   [[ $count == 6 ]] || { echo "Expected six PCI Ethernet controllers; found $count" >&2; exit 1; }
   for i in "${!slots[@]}"; do
-    links=(/sys/bus/pci/devices/0000:${slots[i]}:00.0/net/*)
-    [[ ${#links[@]} == 1 && -e ${links[0]} ]] || { echo "Missing or ambiguous NIC at PCI ${slots[i]}" >&2; exit 1; }
-    iface=${links[0]##*/}; dev="/sys/class/net/$iface/device"
+    iface="eno$i"; dev="/sys/class/net/$iface/device"
     [[ $(basename "$(readlink -f "$dev")") == "0000:${slots[i]}:00.0" && $(cat "$dev/vendor") == 0x8086 && $(cat "$dev/device") == 0x125c && $(basename "$(readlink -f "$dev/driver")") == igc ]] || { echo "Invalid PCI/controller/driver mapping for $iface" >&2; exit 1; }
     mac=$(cat "/sys/class/net/$iface/address") || exit 1
     [[ $mac =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ && $mac != 00:00:00:00:00:00 && -z ${seen[$mac]:-} ]] || exit 1
     seen[$mac]=1
-    printf '%s -> eth%s | PCI 0000:%s:00.0 | MAC %s | igc\n' "$iface" "$i" "${slots[i]}" "$mac"
+    printf '%s | PCI 0000:%s:00.0 | MAC %s | igc\n' "$iface" "${slots[i]}" "$mac"
   done
 )
 
@@ -1994,7 +1866,7 @@ lab_platform_gate() (
   model=$(cat /sys/class/dmi/id/product_name 2>/dev/null) || exit 1
   [[ "${vendor,,}" == *protectli* && "$model" == V1610 ]] || { echo 'INSTALLATION BLOCKED: expected Protectli V1610.' >&2; exit 1; }
   validate_v1610_nics || exit 1
-  if grep -Eq '(^|[[:space:]])(net\.ifnames=0|biosdevname=0)([[:space:]]|$)' /proc/cmdline /etc/default/grub /etc/default/grub.d/*.cfg 2>/dev/null; then echo "INSTALLATION BLOCKED: net.ifnames=0 or biosdevname=0 present; remove them and reboot first; PCI naming service manages eth names." >&2; exit 1; fi
+  if grep -Eq '(^|[[:space:]])(net\.ifnames=0|biosdevname=0)([[:space:]]|$)' /proc/cmdline /etc/default/grub /etc/default/grub.d/*.cfg 2>/dev/null; then echo "INSTALLATION BLOCKED: legacy naming parameters present; remove them and reboot first." >&2; exit 1; fi
   [[ -c /dev/ttyS0 ]] || { echo 'INSTALLATION BLOCKED: ttyS0 missing.' >&2; exit 1; }
 )
 
@@ -2029,7 +1901,6 @@ main() {
   install_domotz
   configure_domotz_permissions
   configure_ufw
-  install_v1610_nic_naming
   stage_network_config
   repair_resolv_conf
   normalize_host_entries
@@ -2056,9 +1927,7 @@ main() {
   progress_message "State File: ${STATE_FILE}"
   progress_message "Log File: ${LOG_FILE}"
   echo "------------------------------------------------------------"
-  echo "Manual reboot is required; use a tested local or USB-C serial console."
-  echo "NIC naming and eth0 DHCP take effect at reboot. Existing static WAN configuration is replaced by DHCP."
-  echo "Network recovery backup path: $(cat "${STATE_DIR}/nic-naming-backup-${REVISION}.txt")"
+  echo "Manual reboot is required."
   echo "After reboot, systemd will run the post-reboot validation automatically."
   echo
   echo "V1610 direct laptop configuration:"
