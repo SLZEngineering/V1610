@@ -1,0 +1,1941 @@
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+###############################################################################
+# Script: rswsolutionz_domotz_setup_rev5091126-V1610-LAB2.sh
+# Company: Solutionz INC / RSW
+# Revision: 5091126-V1610-LAB2
+# Release Date: 2026-09-11
+#
+# Purpose:
+#   Build and harden the Solutionz RMM Agent on the approved Protectli V1610
+#   Ubuntu 24.04 LTS operating-system family, record the manufacturer-delivered
+#   package state, install/validate required components, install Domotz, configure
+#   the V1610 USB-C COM serial console, and install a serial-console local network
+#   configuration utility.
+#
+# Important:
+#   - General "apt upgrade -y" is intentionally NOT used.
+#   - Domotz is intentionally not revision-pinned. The installed Snap revision
+#     is recorded for audit, and updates are governed by operating policy.
+#   - The V1610 USB-C port labeled COM is a serial console, not USB Ethernet.
+#     This script exposes a login shell on ttyS0 and installs
+#     /usr/local/sbin/solutionz-rmm-local-config for direct laptop configuration.
+#   - Ubuntu 24.04 LTS is the controlled OS family. Supported Noble point
+#     release for this lab build is Ubuntu 24.04.3 LTS only.
+#   - Network changes are staged and take effect after manual reboot.
+#   - NTP synchronization is standardized on systemd-timesyncd. The setup enables
+#     systemd-time-wait-sync so time-sync.target represents an actual successful
+#     current-boot synchronization event, and validators wait/retry before failing.
+#   - Serial-console acceptance is based on ttyS0 presence, serial-getty systemd
+#     enabled/active state, and GRUB configuration; a transient agetty process
+#     match is diagnostic only and is not a production failure criterion.
+###############################################################################
+
+REVISION="5091126-V1610-LAB2"
+SCRIPT_NAME="rswsolutionz_domotz_setup_rev5091126-V1610-LAB2.sh"
+RELEASE_DATE="2026-09-11"
+
+SUPPORTED_OS_ID="ubuntu"
+SUPPORTED_UBUNTU_VERSION_ID="24.04"
+SUPPORTED_UBUNTU_CODENAME="noble"
+SUPPORTED_VENDOR="Protectli"
+SUPPORTED_MODEL="V1610"
+
+# Domotz is intentionally NOT revision-pinned.
+# Production installs track the Snap Store stable/default channel and the
+# installed revision is recorded for audit/troubleshooting. Update timing is
+# governed operationally rather than by hard-coding a revision in this script.
+DOMOTZ_SNAP_NAME="domotzpro-agent-publicstore"
+
+LOG_DIR="/var/log/solutionz-rmm/setup"
+RUN_TIMESTAMP="$(date -u +%Y%m%dT%H%M%SZ)"
+LOG_FILE="${LOG_DIR}/install-${REVISION}-${RUN_TIMESTAMP}.log"
+
+STATE_DIR="/var/lib/rswsolutionz-rmm"
+STATE_FILE="${STATE_DIR}/install.state"
+BASELINE_FILE="${STATE_DIR}/package-baseline-${REVISION}.tsv"
+OS_BASELINE_FILE="${STATE_DIR}/os-baseline-${REVISION}.txt"
+MANUFACTURER_BASELINE_FILE="${STATE_DIR}/manufacturer-baseline-${REVISION}.txt"
+MANUFACTURER_PACKAGE_BASELINE_FILE="${STATE_DIR}/manufacturer-packages-${REVISION}.tsv"
+MANUFACTURER_PACKAGE_VALIDATION_FILE="${STATE_DIR}/manufacturer-package-validation-${REVISION}.txt"
+MANUFACTURER_BASELINE_SHA256_FILE="${STATE_DIR}/manufacturer-baseline-${REVISION}.sha256"
+SNAP_BASELINE_FILE="${STATE_DIR}/snap-baseline-${REVISION}.txt"
+NETWORK_REQUIREMENTS_FILE="${STATE_DIR}/network-requirements-${REVISION}.txt"
+
+NETPLAN_FILE="/etc/netplan/00-installer-config.yaml"
+GRUB_FILE="/etc/default/grub"
+MOTD_FILE="/etc/update-motd.d/slz-rsw-login"
+SERIAL_PROFILE_FILE="/etc/profile.d/solutionz-rmm-serial.sh"
+LOCAL_CONFIG_TOOL="/usr/local/sbin/solutionz-rmm-local-config"
+
+SERIAL_DEVICE="/dev/ttyS0"
+SERIAL_SERVICE="serial-getty@ttyS0.service"
+SERIAL_DROPIN_DIR="/etc/systemd/system/serial-getty@ttyS0.service.d"
+SERIAL_DROPIN_FILE="${SERIAL_DROPIN_DIR}/override.conf"
+
+RESOLV_TARGET="/run/systemd/resolve/resolv.conf"
+RESOLV_FILE="/etc/resolv.conf"
+
+POSTREBOOT_VALIDATOR="/usr/local/sbin/rswsolutionz-rmm-postreboot-validate"
+POSTREBOOT_SERVICE="/etc/systemd/system/rswsolutionz-rmm-postreboot-validation.service"
+POSTREBOOT_LOG="${LOG_DIR}/postreboot-validation.log"
+
+NON_INTERACTIVE=0
+CURRENT_STEP="startup"
+
+# Terminal color output. ANSI color is used only for interactive terminals and
+# can be disabled by setting NO_COLOR=1. Log files remain plain text because
+# init_logging strips ANSI escape sequences before writing to disk.
+if [[ -t 1 && -z "${NO_COLOR:-}" && "${TERM:-dumb}" != "dumb" ]]; then
+  COLOR_GREEN=$'\033[32m'
+  COLOR_YELLOW=$'\033[33m'
+  COLOR_RED=$'\033[31m'
+  COLOR_CYAN=$'\033[36m'
+  COLOR_RESET=$'\033[0m'
+else
+  COLOR_GREEN=""
+  COLOR_YELLOW=""
+  COLOR_RED=""
+  COLOR_CYAN=""
+  COLOR_RESET=""
+fi
+
+REQUIRED_DOMOTZ_PERMISSIONS=(
+  "firewall-control"
+  "network-observe"
+  "raw-usb"
+  "shutdown"
+  "system-observe"
+)
+
+# Required Solutionz package set. The manufacturer-delivered state is captured
+# before apt modifies the appliance. Missing packages are reported separately
+# and only those missing packages are installed by this script.
+REQUIRED_PACKAGES=(
+  net-tools
+  openvswitch-switch
+  traceroute
+  dnsutils
+  curl
+  openssl
+  netcat-openbsd
+  nano
+  iputils-ping
+  ufw
+  snapd
+  openssh-server
+  systemd-timesyncd
+  sudo
+  python3
+)
+
+# Solutionz RMM traffic model:
+# - Monitoring traffic originates from this RMM Agent toward monitored AV devices.
+# - Domotz/RMM cloud connections are outbound-initiated by this Agent.
+# - No unsolicited Internet-initiated inbound connection is required.
+# - Host UFW permits inbound TCP 22 and TCP 3000 from any reachable source, per
+#   the requested Solutionz baseline. Perimeter/network policy remains responsible
+#   for preventing unsolicited Internet exposure.
+# - UFW uses "default allow outgoing". Therefore outbound TCP and UDP traffic is
+#   permitted without separate per-port UFW allow rules. Network/perimeter firewalls
+#   must still permit the required traffic described below.
+# - Required outbound TCP: 443, 5671, 32700-57699, 4505-4506, 55022, 11371.
+# - Required/expected UDP: 53 for DNS when UDP transport is used; 123 for NTP;
+#   67/68 for DHCP when eno0 obtains addressing by DHCP; and UDP 161 from the RMM
+#   Agent to monitored devices when SNMP polling is configured.
+# - DNS may also use TCP 53 for fallback/large responses.
+# - Additional TCP/UDP ports may be required by specific monitored AV devices or
+#   manufacturer protocols. ICMP is used for monitoring/reachability where allowed.
+
+usage() {
+  cat <<EOF
+Usage:
+  sudo ./${SCRIPT_NAME} [options]
+
+Options:
+  --non-interactive             Skip the two manual confirmation prompts.
+  --easter-egg                  Display the non-operational 5091126-V1610-LAB2 Easter egg and exit.
+  -h, --help                    Show this help.
+
+Domotz update model:
+  Domotz is not revision-pinned by this script. New installations use the
+  Snap Store stable/default release and the installed revision is logged.
+EOF
+}
+
+show_easter_egg() {
+  printf '%s\n' "${COLOR_CYAN}"
+  cat <<'EASTER_EGG'
+╔══════════════════════════════════════════════════════╗
+║              SOLUTIONZ RMM - REV 5091126-V1610-LAB2            ║
+║                                                      ║
+║  If you found this, you actually read the script.   ║
+║  Statistically, that already puts you ahead.        ║
+║                                                      ║
+║  Monitor everything. Trust nothing. Check the logs. ║
+╚══════════════════════════════════════════════════════╝
+EASTER_EGG
+  printf '%s' "${COLOR_RESET}"
+}
+
+parse_args() {
+  while (($#)); do
+    case "$1" in
+      --non-interactive)
+        NON_INTERACTIVE=1
+        ;;
+      --easter-egg)
+        show_easter_egg
+        exit 0
+        ;;
+      -h|--help)
+        usage
+        exit 0
+        ;;
+      *)
+        echo "Unknown option: $1" >&2
+        usage >&2
+        exit 2
+        ;;
+    esac
+    shift
+  done
+}
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "ERROR: Run this script with sudo or as root." >&2
+    exit 1
+  fi
+}
+
+init_logging() {
+  mkdir -p "${LOG_DIR}" "${STATE_DIR}"
+  chmod 750 "${LOG_DIR}" "${STATE_DIR}"
+  touch "${LOG_FILE}"
+  chmod 640 "${LOG_FILE}"
+  # Preserve color in the terminal while keeping the persistent log free of
+  # ANSI escape sequences.
+  exec > >(tee -i >(sed -u 's/\x1B\[[0-9;]*[mK]//g' >> "${LOG_FILE}")) 2>&1
+}
+
+progress_message() {
+  printf ' %s[+] %s%s\n' "${COLOR_GREEN}" "$1" "${COLOR_RESET}"
+}
+
+warning_message() {
+  printf ' %s[!] WARNING: %s%s\n' "${COLOR_YELLOW}" "$1" "${COLOR_RESET}"
+}
+
+step_message() {
+  CURRENT_STEP="$1 - $2"
+  echo "------------------------------------------------------------"
+  echo "Step $1: $2"
+  echo "------------------------------------------------------------"
+}
+
+write_state() {
+  local status="$1"
+  shift || true
+  local tmp="${STATE_FILE}.tmp.$$"
+
+  {
+    printf '%s\n' "${status}"
+    printf 'revision=%s\n' "${REVISION}"
+    printf 'script=%s\n' "${SCRIPT_NAME}"
+    printf 'timestamp_utc=%s\n' "$(date -u +%FT%TZ)"
+    printf 'step=%s\n' "${CURRENT_STEP}"
+    for line in "$@"; do
+      printf '%s\n' "${line}"
+    done
+  } > "${tmp}"
+
+  chmod 640 "${tmp}"
+  mv -f "${tmp}" "${STATE_FILE}"
+}
+
+backup_previous_state() {
+  if [[ -f "${STATE_FILE}" ]]; then
+    cp -a "${STATE_FILE}" "${STATE_FILE}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  fi
+}
+
+
+record_network_requirements() {
+  cat > "${NETWORK_REQUIREMENTS_FILE}" <<'EOF'
+Solutionz RMM Agent Network Requirements - Revision 5091126-V1610-LAB2
+
+Traffic model
+- Monitoring traffic originates from the RMM Agent to monitored AV devices.
+- RMM/Domotz cloud sessions are initiated outbound by the RMM Agent.
+- No unsolicited Internet-initiated inbound connection is required for normal
+  RMM/Domotz cloud communication.
+
+Outbound TCP - cloud/platform
+- TCP 443          Domotz portal/API/orchestration and Ubuntu/Canonical/Snap HTTPS
+- TCP 5671         Domotz secure messaging/orchestration
+- TCP 32700-57699  Domotz remote relay/secure remote connectivity
+- TCP 4505-4506    Domotz provisioning
+- TCP 55022        Domotz tunnel/remote support
+- TCP 11371        Key-server/package provisioning or maintenance where required
+- TCP 53           DNS fallback/large responses when the resolver requires TCP
+
+Outbound/local UDP
+- UDP 53           DNS queries when the resolver uses UDP transport
+- UDP 123          NTP/time synchronization
+- UDP 67/68        DHCP client/server exchange when eno0 is configured for DHCP
+- UDP 161          SNMP polling from the RMM Agent to monitored devices when SNMP
+                   monitoring is configured
+- Additional UDP   As required by a specific monitored-device manufacturer protocol
+
+Other required traffic
+- ICMP             Device heartbeat/reachability, response-time and packet-loss tests
+                   where the routed network/security policy permits ICMP
+
+Local monitored-device traffic
+- HTTP/HTTPS       TCP 80/443 when used by the monitored device
+- SSH              TCP 22 when used for device monitoring/management
+- SNMP             UDP 161 when SNMP polling is configured
+- Manufacturer-specific TCP/UDP ports as required by the monitored device profile
+- Routed networks/VLAN ACLs must permit the RMM Agent to reach each monitored
+  device on the protocol/port required for that device.
+
+Agent host firewall inbound allowances
+- TCP 22           SSH administration
+- TCP 3000         Local Domotz Agent service
+
+UFW baseline
+- Default incoming: deny
+- Default outgoing: allow
+- TCP 22: allow from any reachable source
+- TCP 3000: allow from any reachable source
+- No separate outbound TCP/UDP UFW rules are created because the host baseline is
+  default-allow for outbound traffic. This does not override upstream firewall, ACL,
+  VLAN, proxy, or perimeter-security restrictions.
+
+Security boundary note
+- Global TCP 22/TCP 3000 allowance on the RMM Agent host does not mean either port
+  should be published through Internet NAT or permitted as unsolicited Internet
+  inbound traffic. Perimeter policy remains responsible for preventing that exposure.
+- Upstream firewalls must allow the required outbound TCP/UDP traffic and the local
+  monitoring traffic needed for the monitored AV devices.
+EOF
+  chmod 640 "${NETWORK_REQUIREMENTS_FILE}"
+  progress_message "Recorded network requirements: ${NETWORK_REQUIREMENTS_FILE}"
+}
+
+record_failure_and_exit() {
+  local rc="$1"
+  local line="$2"
+  local command="$3"
+  trap - ERR
+  set +e
+  write_state "phase1_failed" \
+    "exit_code=${rc}" \
+    "line=${line}" \
+    "command=${command}"
+  printf ' %s[!] INSTALLATION FAILED%s\n' "${COLOR_RED}" "${COLOR_RESET}"
+  printf ' %s[!] Step: %s%s\n' "${COLOR_RED}" "${CURRENT_STEP}" "${COLOR_RESET}"
+  printf ' %s[!] Line: %s%s\n' "${COLOR_RED}" "${line}" "${COLOR_RESET}"
+  printf ' %s[!] Exit code: %s%s\n' "${COLOR_RED}" "${rc}" "${COLOR_RESET}"
+  printf ' %s[!] Command: %s%s\n' "${COLOR_RED}" "${command}" "${COLOR_RESET}"
+  printf ' %s[!] Log: %s%s\n' "${COLOR_RED}" "${LOG_FILE}" "${COLOR_RESET}"
+  exit "${rc}"
+}
+
+on_error() {
+  local rc=$?
+  local line="$1"
+  local command="$2"
+  record_failure_and_exit "${rc}" "${line}" "${command}"
+}
+
+error_exit() {
+  local message="$1"
+  trap - ERR
+  set +e
+  printf ' %s[!] ERROR: %s%s\n' "${COLOR_RED}" "${message}" "${COLOR_RESET}"
+  write_state "phase1_failed" "error=${message}"
+  exit 1
+}
+
+trap 'on_error "${LINENO}" "${BASH_COMMAND}"' ERR
+
+prompt_confirmation() {
+  if (( NON_INTERACTIVE == 1 )); then
+    progress_message "Non-interactive mode selected; confirmation prompts skipped."
+    return 0
+  fi
+
+  echo -e "\e[36m
+  _____   ____    _      _    _   _____   _    ____   _     _
+ / ____| / __ \  | |    | |  | | |_   _| | |  / __ \ | \   | |  _____
+| (___  | |  | | | |    | |  | |   | |   | | | |  | ||  \  | | |___ /
+ \___ \ | |  | | | |    | |  | |   | |   | | | |  | || |\ \| |   / /
+ ____) || |__| | | |___ | |__| |   | |   | | | |__| || |  \  |  / /__
+|_____/  \____/  |_____| \____/    |_|   |_|  \____/ |_|   \_| /_____|
+
+Solutionz RMM Agent Build - Revision ${REVISION}
+\e[0m"
+
+  cat <<EOF
+This script will:
+  1. Validate the Ubuntu 24.04 LTS OS family and Protectli V1610 hardware.
+  2. Record the manufacturer-delivered OS/package state before modification.
+  3. Install only missing required packages; no general apt upgrade is performed.
+  4. Verify SSH, TUN, Snap, Domotz, and required Domotz permissions.
+  5. Configure UFW with inbound TCP 22/TCP 3000 permitted and default-allow outbound TCP/UDP traffic.
+  6. Stage Netplan with eno0 as the RMM network interface and eno1-eno5 reserved.
+  7. Repair and validate system DNS behavior.
+  8. Normalize Solutionz hostname entries.
+  9. Configure GRUB interface naming and the V1610 USB-C COM serial console.
+ 10. Install a direct serial-console network configuration utility.
+ 11. Install post-reboot production validation.
+ 12. Stage all changes without automatically rebooting.
+
+USB-C COM direct laptop configuration:
+  After reboot, connect a laptop to the V1610 USB-C port labeled COM.
+  Use 115200 baud, 8 data bits, no parity, 1 stop bit (8N1).
+  Log in normally, then run:
+      sudo ${LOCAL_CONFIG_TOOL}
+
+Domotz note:
+  Domotz is intentionally not revision-pinned. The installed Snap revision is
+  recorded for audit and support.
+EOF
+
+  read -r -p "Type 'yes' to proceed: " confirmation1
+  [[ "${confirmation1}" == "yes" ]] || error_exit "Confirmation not received."
+
+  read -r -p "Type 'yes' again to confirm production configuration changes: " confirmation2
+  [[ "${confirmation2}" == "yes" ]] || error_exit "Second confirmation not received."
+}
+
+read_dmi_value() {
+  local path="$1"
+  if [[ -r "${path}" ]]; then
+    tr -d '\0' < "${path}" | xargs
+  else
+    printf 'unknown'
+  fi
+}
+
+
+dns_resolves_ipv4() {
+  local host="$1"
+  getent ahostsv4 "${host}" 2>/dev/null | awk '{print $1}' | grep -Eq '^[0-9]+(\.[0-9]+){3}$'
+}
+
+ntp_is_synchronized() {
+  local synced=""
+  synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+
+  # systemd-timesyncd creates this runtime marker only after a successful sync.
+  # /run is recreated at boot, so this is fresh evidence for the current boot.
+  if [[ "${synced}" == "yes" || -e /run/systemd/timesync/synchronized ]]; then
+    return 0
+  fi
+
+  return 1
+}
+
+wait_for_ntp_sync() {
+  local attempts="${1:-36}"
+  local delay_seconds="${2:-5}"
+  local attempt
+
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if ntp_is_synchronized; then
+      return 0
+    fi
+
+    if (( attempt < attempts )); then
+      sleep "${delay_seconds}"
+    fi
+  done
+
+  return 1
+}
+
+report_ntp_diagnostics() {
+  echo "INFO - NTP diagnostics:"
+  timedatectl status 2>/dev/null | sed -n '1,20p' || true
+  timedatectl timesync-status --no-pager 2>/dev/null | sed -n '1,40p' || true
+  systemctl status systemd-timesyncd.service --no-pager -l 2>/dev/null | sed -n '1,40p' || true
+}
+
+preflight_checks() {
+  step_message 1 "Preflight validation"
+
+  [[ -r /etc/os-release ]] || error_exit "/etc/os-release not found."
+  # shellcheck disable=SC1091
+  source /etc/os-release
+
+  [[ "${ID:-}" == "${SUPPORTED_OS_ID}" ]] || \
+    error_exit "Unsupported OS ID '${ID:-unknown}'. Expected ${SUPPORTED_OS_ID}."
+  [[ "${VERSION_ID:-}" == "${SUPPORTED_UBUNTU_VERSION_ID}" ]] || \
+    error_exit "Unsupported Ubuntu VERSION_ID '${VERSION_ID:-unknown}'. Expected the Ubuntu ${SUPPORTED_UBUNTU_VERSION_ID} LTS family."
+
+  if [[ -n "${VERSION_CODENAME:-}" && "${VERSION_CODENAME}" != "${SUPPORTED_UBUNTU_CODENAME}" ]]; then
+    error_exit "Unsupported Ubuntu codename '${VERSION_CODENAME}'. Expected ${SUPPORTED_UBUNTU_CODENAME}."
+  fi
+
+  [[ "${VERSION:-}" == "24.04.3 LTS (Noble Numbat)" ]] || error_exit "Unsupported point release: ${VERSION:-unknown}."
+  progress_message "Ubuntu ${SUPPORTED_UBUNTU_VERSION_ID} LTS OS family verified (Ubuntu 24.04.3 LTS only)."
+  progress_message "Detected runtime release: ${PRETTY_NAME:-${VERSION:-unknown}}"
+  # /etc/os-release is commonly a relative symlink to /usr/lib/os-release.
+  # Never copy or redirect directly onto the final baseline path because an
+  # older run may have left that path as a dangling symlink. Build a regular
+  # temporary file first, then atomically replace the destination itself.
+  local os_baseline_tmp
+  os_baseline_tmp="$(mktemp "${STATE_DIR}/.os-baseline-${REVISION}.XXXXXX")"
+  cat /etc/os-release > "${os_baseline_tmp}"
+  chmod 640 "${os_baseline_tmp}"
+  chown root:root "${os_baseline_tmp}"
+  mv -Tf "${os_baseline_tmp}" "${OS_BASELINE_FILE}"
+  [[ -f "${OS_BASELINE_FILE}" && ! -L "${OS_BASELINE_FILE}" && -s "${OS_BASELINE_FILE}" ]] || \
+    error_exit "Unable to create regular OS baseline record at ${OS_BASELINE_FILE}."
+  progress_message "OS runtime baseline recorded as a regular file: ${OS_BASELINE_FILE}"
+
+  local sys_vendor product_name
+  sys_vendor="$(read_dmi_value /sys/class/dmi/id/sys_vendor)"
+  product_name="$(read_dmi_value /sys/class/dmi/id/product_name)"
+
+  progress_message "Detected hardware vendor: ${sys_vendor}"
+  progress_message "Detected hardware model: ${product_name}"
+
+  if [[ "${sys_vendor,,}" != *"${SUPPORTED_VENDOR,,}"* || "${product_name}" != "${SUPPORTED_MODEL}" ]]; then
+    error_exit "Unsupported hardware. Production revision ${REVISION} is approved only for ${SUPPORTED_VENDOR} ${SUPPORTED_MODEL}; detected '${sys_vendor} ${product_name}'."
+  fi
+  progress_message "Protectli V1610 hardware preflight passed."
+
+  if [[ ! -c "${SERIAL_DEVICE}" ]]; then
+    error_exit "Required V1610 serial device ${SERIAL_DEVICE} was not detected."
+  fi
+  progress_message "Detected V1610 serial device ${SERIAL_DEVICE}."
+
+  local free_kb
+  free_kb="$(df -Pk / | awk 'NR==2 {print $4}')"
+  if [[ -z "${free_kb}" || "${free_kb}" -lt 2097152 ]]; then
+    error_exit "Less than 2 GB free space is available on the root filesystem."
+  fi
+  progress_message "Disk-space preflight passed."
+
+  local default_iface default_gateway current_cidr
+  default_iface="$(ip -4 route show default | awk 'NR==1 {print $5}')"
+  default_gateway="$(ip -4 route show default | awk 'NR==1 {print $3}')"
+  [[ "${default_iface}" == eno0 ]] || error_exit "Expected current default route on eno0; detected ${default_iface:-none}."
+  current_cidr="$(ip -o -4 addr show dev "${default_iface}" scope global | awk 'NR==1 {print $4}')"
+  [[ -n "${current_cidr}" ]] || error_exit "Default-route interface ${default_iface} has no global IPv4 address."
+  progress_message "Network preflight: ${default_iface} ${current_cidr}, gateway ${default_gateway:-not-reported}."
+
+  dns_resolves_ipv4 archive.ubuntu.com || error_exit "DNS cannot resolve archive.ubuntu.com to IPv4."
+  dns_resolves_ipv4 api.snapcraft.io || error_exit "DNS cannot resolve api.snapcraft.io to IPv4."
+  dns_resolves_ipv4 security.ubuntu.com || error_exit "DNS cannot resolve security.ubuntu.com to IPv4."
+
+  timeout 8 bash -c '</dev/tcp/archive.ubuntu.com/80' || \
+    error_exit "Cannot establish TCP connectivity to archive.ubuntu.com:80 for package bootstrap."
+  timeout 8 bash -c '</dev/tcp/api.snapcraft.io/443' || \
+    error_exit "Cannot establish TCP connectivity to api.snapcraft.io:443."
+  timeout 8 bash -c '</dev/tcp/security.ubuntu.com/443' || \
+    warning_message "TCP 443 to security.ubuntu.com could not be confirmed; apt source configuration may use another transport/mirror."
+
+  if command -v timedatectl >/dev/null 2>&1; then
+    local synced
+    synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+    if [[ "${synced}" != "yes" ]]; then
+      warning_message "System time is not currently reported as NTP synchronized."
+    else
+      progress_message "System time synchronization verified."
+    fi
+  fi
+}
+
+capture_manufacturer_baseline() {
+  CURRENT_STEP="1A - Capture manufacturer-delivered baseline"
+  echo "------------------------------------------------------------"
+  echo "Step 1A: Capture manufacturer-delivered baseline"
+  echo "------------------------------------------------------------"
+
+  progress_message "Recording manufacturer-delivered system state before package modification."
+
+  # Preserve the first manufacturer baseline across retries/reruns. Once the
+  # baseline exists, validate its checksum rather than replacing it with an
+  # already-modified system state.
+  if [[ -s "${MANUFACTURER_BASELINE_FILE}" && \
+        -s "${MANUFACTURER_PACKAGE_BASELINE_FILE}" && \
+        -s "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" ]]; then
+    if [[ ! -s "${MANUFACTURER_BASELINE_SHA256_FILE}" ]]; then
+      sha256sum \
+        "${MANUFACTURER_BASELINE_FILE}" \
+        "${MANUFACTURER_PACKAGE_BASELINE_FILE}" \
+        "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" \
+        > "${MANUFACTURER_BASELINE_SHA256_FILE}"
+      chmod 640 "${MANUFACTURER_BASELINE_SHA256_FILE}"
+      warning_message "Existing manufacturer baseline had no checksum record; checksum created without replacing the preserved baseline."
+    fi
+
+    if ! sha256sum -c "${MANUFACTURER_BASELINE_SHA256_FILE}" >/dev/null 2>&1; then
+      error_exit "Existing manufacturer baseline integrity validation failed. Do not overwrite the original baseline; investigate ${STATE_DIR}."
+    fi
+
+    progress_message "Existing manufacturer baseline is intact and will be preserved."
+    return 0
+  fi
+
+  # If a partial prior baseline exists, preserve it for investigation before
+  # creating a complete baseline set.
+  local partial_backup_dir=""
+  if [[ -e "${MANUFACTURER_BASELINE_FILE}" || \
+        -e "${MANUFACTURER_PACKAGE_BASELINE_FILE}" || \
+        -e "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" || \
+        -e "${MANUFACTURER_BASELINE_SHA256_FILE}" ]]; then
+    partial_backup_dir="${STATE_DIR}/manufacturer-baseline-partial-$(date -u +%Y%m%dT%H%M%SZ)"
+    mkdir -p "${partial_backup_dir}"
+    for existing in \
+      "${MANUFACTURER_BASELINE_FILE}" \
+      "${MANUFACTURER_PACKAGE_BASELINE_FILE}" \
+      "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" \
+      "${MANUFACTURER_BASELINE_SHA256_FILE}"; do
+      [[ -e "${existing}" ]] && cp -a "${existing}" "${partial_backup_dir}/"
+    done
+    warning_message "Partial manufacturer baseline records were preserved at ${partial_backup_dir} before recapture."
+  fi
+
+  {
+    echo "Solutionz RMM Manufacturer Baseline"
+    echo "Revision: ${REVISION}"
+    echo "Captured UTC: $(date -u +%FT%TZ)"
+    echo
+    echo "===== Operating System ====="
+    cat /etc/os-release 2>/dev/null || true
+    echo "Kernel: $(uname -r)"
+    echo "Architecture: $(uname -m)"
+    echo
+    echo "===== Protectli / DMI ====="
+    for field in sys_vendor product_name product_version board_name board_vendor bios_vendor bios_version bios_date; do
+      path="/sys/class/dmi/id/${field}"
+      if [[ -r "${path}" ]]; then
+        printf '%s: %s\n' "${field}" "$(tr -d '\0' < "${path}" | xargs)"
+      fi
+    done
+    echo
+    echo "===== Storage ====="
+    lsblk -o NAME,TYPE,SIZE,FSTYPE,MOUNTPOINTS,MODEL,SERIAL 2>/dev/null || true
+    echo
+    echo "===== Network Interfaces ====="
+    ip -br link 2>/dev/null || true
+    ip -br addr 2>/dev/null || true
+    ip route 2>/dev/null || true
+    echo
+    echo "===== Snap Inventory ====="
+    if command -v snap >/dev/null 2>&1; then
+      snap list 2>/dev/null || true
+    else
+      echo "snap command not present at manufacturer-baseline capture"
+    fi
+  } > "${MANUFACTURER_BASELINE_FILE}"
+  chmod 640 "${MANUFACTURER_BASELINE_FILE}"
+
+  # Record every dpkg package exactly as received before this setup script
+  # performs apt-get update or installs anything.
+  dpkg-query -W -f='${Package}\t${Version}\t${db:Status-Abbrev}\n' 2>/dev/null \
+    | LC_ALL=C sort > "${MANUFACTURER_PACKAGE_BASELINE_FILE}"
+  chmod 640 "${MANUFACTURER_PACKAGE_BASELINE_FILE}"
+
+  local installed_count=0
+  local missing_count=0
+  local pkg version
+  {
+    echo "Solutionz RMM Manufacturer Required-Package Validation"
+    echo "Revision: ${REVISION}"
+    echo "Captured UTC: $(date -u +%FT%TZ)"
+    echo "Supported OS family: Ubuntu ${SUPPORTED_UBUNTU_VERSION_ID} LTS"
+    echo
+    for pkg in "${REQUIRED_PACKAGES[@]}"; do
+      if dpkg-query -W -f='${db:Status-Abbrev}' "${pkg}" 2>/dev/null | grep -q '^ii'; then
+        version="$(dpkg-query -W -f='${Version}' "${pkg}" 2>/dev/null || true)"
+        printf 'PASS\t%s\t%s\n' "${pkg}" "${version:-unknown}"
+        installed_count=$((installed_count + 1))
+      else
+        printf 'MISSING\t%s\t-\n' "${pkg}"
+        missing_count=$((missing_count + 1))
+      fi
+    done
+    echo
+    echo "installed_required_packages=${installed_count}"
+    echo "missing_required_packages=${missing_count}"
+    if (( missing_count == 0 )); then
+      echo "manufacturer_package_validation=PASS"
+    else
+      echo "manufacturer_package_validation=DEVIATION"
+    fi
+  } > "${MANUFACTURER_PACKAGE_VALIDATION_FILE}"
+  chmod 640 "${MANUFACTURER_PACKAGE_VALIDATION_FILE}"
+
+  sha256sum \
+    "${MANUFACTURER_BASELINE_FILE}" \
+    "${MANUFACTURER_PACKAGE_BASELINE_FILE}" \
+    "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" \
+    > "${MANUFACTURER_BASELINE_SHA256_FILE}"
+  chmod 640 "${MANUFACTURER_BASELINE_SHA256_FILE}"
+
+  if ! sha256sum -c "${MANUFACTURER_BASELINE_SHA256_FILE}" >/dev/null 2>&1; then
+    error_exit "Manufacturer baseline checksum validation failed immediately after capture."
+  fi
+
+  if (( missing_count == 0 )); then
+    progress_message "Manufacturer package validation passed: all required packages were already present."
+  else
+    warning_message "Manufacturer package validation found ${missing_count} missing required package(s). The deviation is recorded; the setup script will install only the missing packages."
+  fi
+
+  progress_message "Manufacturer baseline: ${MANUFACTURER_BASELINE_FILE}"
+  progress_message "Manufacturer package inventory: ${MANUFACTURER_PACKAGE_BASELINE_FILE}"
+  progress_message "Manufacturer package validation: ${MANUFACTURER_PACKAGE_VALIDATION_FILE}"
+  progress_message "Manufacturer baseline checksums: ${MANUFACTURER_BASELINE_SHA256_FILE}"
+}
+
+install_required_packages() {
+  step_message 2 "Validate/install missing required packages without a general system upgrade"
+
+  export DEBIAN_FRONTEND=noninteractive
+  export NEEDRESTART_MODE=a
+
+  local -a missing_packages=()
+  local pkg
+  for pkg in "${REQUIRED_PACKAGES[@]}"; do
+    if ! dpkg-query -W -f='${db:Status-Abbrev}' "${pkg}" 2>/dev/null | grep -q '^ii'; then
+      missing_packages+=("${pkg}")
+    fi
+  done
+
+  if (( ${#missing_packages[@]} == 0 )); then
+    progress_message "All required packages were supplied by the manufacturer; apt package installation is not required."
+  else
+    warning_message "${#missing_packages[@]} required package(s) are missing from the manufacturer baseline: ${missing_packages[*]}"
+    progress_message "Updating package indexes only because required packages are missing..."
+    if ! apt-get update; then
+      error_exit "apt-get update failed. Review ${LOG_FILE} for repository, DNS, or network errors."
+    fi
+    progress_message "Package index update completed successfully."
+
+    progress_message "Installing only the missing approved package(s)..."
+    local install_plan
+    install_plan=$(apt-get -s install --no-install-recommends "${missing_packages[@]}") || error_exit "Package simulation failed."
+    if grep -Eq '^Inst base-files([ :]|$)' <<< "$install_plan"; then
+      error_exit "Dependency installation would change base-files and may advance the point release. Use a controlled lab repository."
+    fi
+    if ! apt-get install -y --no-install-recommends "${missing_packages[@]}"; then
+      error_exit "Required package installation failed. Review ${LOG_FILE} for the package that failed and the apt/dpkg error."
+    fi
+    progress_message "Missing required package installation completed successfully."
+  fi
+
+  progress_message "Recording final required-package versions after setup package handling..."
+  : > "${BASELINE_FILE}"
+  for pkg in "${REQUIRED_PACKAGES[@]}"; do
+    if ! dpkg-query -W -f='${Package}\t${Version}\n' "${pkg}" >> "${BASELINE_FILE}" 2>/dev/null; then
+      error_exit "Required package ${pkg} is still missing after package handling."
+    fi
+  done
+  chmod 640 "${BASELINE_FILE}"
+}
+
+verify_required_packages() {
+  step_message 3 "Verify final required-package state"
+
+  local pkg
+  for pkg in "${REQUIRED_PACKAGES[@]}"; do
+    dpkg -s "${pkg}" >/dev/null 2>&1 || error_exit "Required package missing after setup package handling: ${pkg}"
+    progress_message "Verified: ${pkg}"
+  done
+
+  command -v nano >/dev/null 2>&1 || error_exit "nano command not found."
+  command -v ping >/dev/null 2>&1 || error_exit "ping command not found."
+  command -v ufw >/dev/null 2>&1 || error_exit "ufw command not found."
+  command -v python3 >/dev/null 2>&1 || error_exit "python3 command not found."
+}
+
+verify_ssh_service() {
+  step_message 4 "Enable and verify SSH service"
+
+  systemctl enable --now ssh
+  systemctl is-enabled ssh >/dev/null 2>&1 || error_exit "SSH service is not enabled."
+  systemctl is-active ssh >/dev/null 2>&1 || error_exit "SSH service is not active."
+  progress_message "SSH service is enabled and active."
+}
+
+configure_time_sync() {
+  CURRENT_STEP="4A - Enable and verify NTP time synchronization"
+  echo "------------------------------------------------------------"
+  echo "Step 4A: Enable and verify NTP time synchronization"
+  echo "------------------------------------------------------------"
+
+  command -v timedatectl >/dev/null 2>&1 || error_exit "timedatectl is unavailable; NTP synchronization cannot be managed."
+  systemctl list-unit-files systemd-timesyncd.service >/dev/null 2>&1 || \
+    error_exit "systemd-timesyncd.service is unavailable; the required systemd-timesyncd package is not installed correctly."
+
+  # Revision 5091126-V1610-LAB2 standardizes Ubuntu time synchronization on
+  # systemd-timesyncd. timedatectl enables network time, while the explicit
+  # service commands make the runtime/startup state deterministic.
+  timedatectl set-ntp true >/dev/null 2>&1 || \
+    error_exit "Unable to enable network time synchronization with timedatectl."
+  systemctl enable systemd-timesyncd.service >/dev/null 2>&1 || \
+    error_exit "systemd-timesyncd.service could not be enabled."
+  systemctl restart systemd-timesyncd.service >/dev/null 2>&1 || \
+    error_exit "systemd-timesyncd.service could not be started/restarted."
+
+  # time-sync.target does not itself guarantee accurate synchronization.
+  # systemd-time-wait-sync.service is what delays time-sync.target until
+  # systemd-timesyncd has successfully synchronized to a remote reference.
+  if systemctl list-unit-files systemd-time-wait-sync.service >/dev/null 2>&1; then
+    systemctl enable systemd-time-wait-sync.service >/dev/null 2>&1 || \
+      error_exit "systemd-time-wait-sync.service could not be enabled."
+  else
+    error_exit "systemd-time-wait-sync.service is unavailable on this Ubuntu 24.04 LTS installation."
+  fi
+
+  systemctl is-enabled --quiet systemd-timesyncd.service || \
+    error_exit "systemd-timesyncd.service is not enabled after configuration."
+  systemctl is-active --quiet systemd-timesyncd.service || \
+    error_exit "systemd-timesyncd.service is not active after configuration."
+
+  progress_message "NTP service configured. Waiting up to 180 seconds for initial synchronization."
+  if wait_for_ntp_sync 36 5; then
+    progress_message "System clock is synchronized to a network time source."
+  else
+    report_ntp_diagnostics
+    warning_message "System clock has not synchronized within 180 seconds. Final pre-reboot validation will retry; UDP 123, DNS, DHCP-provided NTP, and upstream firewall policy should be reviewed if it remains unsynchronized."
+  fi
+}
+
+configure_tun() {
+  step_message 5 "Load and validate TUN support"
+
+  modprobe tun
+  grep -qxF 'tun' /etc/modules || echo 'tun' >> /etc/modules
+  [[ -c /dev/net/tun ]] || error_exit "/dev/net/tun is not available after loading the tun module."
+  progress_message "TUN support validated."
+}
+
+ensure_snapd() {
+  step_message 6 "Enable and verify Snap service"
+
+  systemctl enable --now snapd.socket
+  systemctl start snapd.service
+  systemctl is-active snapd.service >/dev/null 2>&1 || error_exit "snapd service is not active."
+
+  snap version >/dev/null 2>&1 || error_exit "snap command is not operational."
+  progress_message "Snap service is operational."
+}
+
+install_domotz() {
+  step_message 7 "Install and validate Domotz Pro Agent"
+
+  local installed=0
+  if snap list "${DOMOTZ_SNAP_NAME}" >/dev/null 2>&1; then
+    installed=1
+    progress_message "Domotz is already installed. Revision pinning is not used by policy."
+  fi
+
+  if (( installed == 0 )); then
+    if ! snap install "${DOMOTZ_SNAP_NAME}"; then
+      error_exit "Domotz Snap installation failed."
+    fi
+  fi
+
+  if ! snap list "${DOMOTZ_SNAP_NAME}" > "${SNAP_BASELINE_FILE}"; then
+    error_exit "Domotz installation could not be verified after snap install."
+  fi
+  chmod 640 "${SNAP_BASELINE_FILE}"
+  progress_message "Domotz installation verified; installed revision recorded at ${SNAP_BASELINE_FILE}."
+  cat "${SNAP_BASELINE_FILE}"
+}
+
+configure_domotz_permissions() {
+  step_message 8 "Connect and verify required Domotz permissions"
+
+  local permission
+  for permission in "${REQUIRED_DOMOTZ_PERMISSIONS[@]}"; do
+    progress_message "Connecting Domotz permission: ${permission}"
+    if ! snap connect "${DOMOTZ_SNAP_NAME}:${permission}"; then
+      error_exit "Failed to connect required Domotz permission: ${permission}"
+    fi
+
+    if ! snap connections "${DOMOTZ_SNAP_NAME}" | awk -v p="${permission}" '
+      $1 == p && $3 != "-" {found=1}
+      END {exit found ? 0 : 1}
+    '; then
+      error_exit "Required Domotz permission is not connected: ${permission}"
+    fi
+  done
+}
+
+configure_ufw() {
+  step_message 9 "Configure and verify UFW"
+
+  if ! ufw default deny incoming; then
+    error_exit "Unable to set UFW default incoming policy."
+  fi
+  if ! ufw default allow outgoing; then
+    error_exit "Unable to set UFW default outgoing policy. RMM/Domotz and monitoring traffic must be able to originate from the Agent."
+  fi
+
+  # Production requirement supplied by Solutionz: SSH and local Domotz service
+  # ports are permitted globally on the Agent host firewall. This does not mean
+  # unsolicited Internet inbound traffic is required; upstream/perimeter controls
+  # remain responsible for Internet exposure.
+  if ! ufw allow 22/tcp; then
+    error_exit "Failed to create global inbound UFW rule for TCP 22 (SSH)."
+  fi
+  if ! ufw allow 3000/tcp; then
+    error_exit "Failed to create global inbound UFW rule for TCP 3000 (local Domotz Agent service)."
+  fi
+  if ! ufw --force enable; then
+    error_exit "UFW could not be enabled."
+  fi
+
+  ufw status | grep -q "Status: active" || error_exit "UFW did not become active."
+  ufw status | grep -Eq '^22/tcp[[:space:]]+ALLOW' || error_exit "Expected global SSH UFW rule was not found."
+  ufw status | grep -Eq '^3000/tcp[[:space:]]+ALLOW' || error_exit "Expected global TCP 3000 UFW rule was not found."
+
+  progress_message "UFW validated: inbound TCP 22/TCP 3000 are permitted; outbound TCP/UDP traffic is allowed by default."
+  ufw status verbose
+}
+
+write_netplan_config() {
+  cat > "${NETPLAN_FILE}" <<'YAML'
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    eno0:
+      dhcp4: true
+      dhcp6: false
+      accept-ra: false
+
+    eno1:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      optional: true
+    eno2:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      optional: true
+    eno3:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      optional: true
+    eno4:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      optional: true
+    eno5:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      optional: true
+YAML
+  chmod 600 "${NETPLAN_FILE}"
+}
+
+remove_stale_cloud_init_netplans() {
+  shopt -s nullglob
+  local files=(/etc/netplan/50-cloud-init*)
+  if (( ${#files[@]} > 0 )); then
+    rm -f "${files[@]}"
+    progress_message "Removed stale cloud-init Netplan files."
+  fi
+  shopt -u nullglob
+}
+
+stage_network_config() {
+  step_message 10 "Stage Solutionz Netplan configuration"
+
+  if [[ -f "${NETPLAN_FILE}" ]]; then
+    cp -a "${NETPLAN_FILE}" "${NETPLAN_FILE}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  fi
+
+  local f
+  for f in /etc/netplan/*.yaml /etc/netplan/*.yml; do
+    [[ -e "$f" ]] || continue
+    case "$f" in "$NETPLAN_FILE"|/etc/netplan/50-cloud-init*) ;; *) error_exit "Unexpected Netplan file: $f; review before staging." ;; esac
+  done
+  write_netplan_config
+  remove_stale_cloud_init_netplans
+
+  mkdir -p /etc/cloud/cloud.cfg.d
+  cat > /etc/cloud/cloud.cfg.d/99-disable-network-config.cfg <<'EOF'
+network: {config: disabled}
+EOF
+
+  netplan generate
+  progress_message "Netplan syntax validated. Configuration is staged but not applied during this remote session."
+}
+
+repair_resolv_conf() {
+  step_message 11 "Repair and validate DNS resolver"
+
+  systemctl enable --now systemd-resolved
+
+  if [[ -L "${RESOLV_FILE}" ]]; then
+    local current_target
+    current_target="$(readlink -f "${RESOLV_FILE}" || true)"
+    if [[ "${current_target}" != "${RESOLV_TARGET}" ]]; then
+      rm -f "${RESOLV_FILE}"
+      ln -s "${RESOLV_TARGET}" "${RESOLV_FILE}"
+    fi
+  else
+    rm -f "${RESOLV_FILE}"
+    ln -s "${RESOLV_TARGET}" "${RESOLV_FILE}"
+  fi
+
+  [[ "$(readlink -f "${RESOLV_FILE}")" == "${RESOLV_TARGET}" ]] || \
+    error_exit "${RESOLV_FILE} does not resolve to ${RESOLV_TARGET}."
+
+  dns_resolves_ipv4 api.snapcraft.io || error_exit "DNS validation failed: api.snapcraft.io did not return an IPv4 address."
+  dns_resolves_ipv4 archive.ubuntu.com || error_exit "DNS validation failed: archive.ubuntu.com did not return an IPv4 address."
+  dns_resolves_ipv4 security.ubuntu.com || error_exit "DNS validation failed: security.ubuntu.com did not return an IPv4 address."
+
+  if command -v resolvectl >/dev/null 2>&1; then
+    resolvectl query api.snapcraft.io >/dev/null 2>&1 || error_exit "systemd-resolved query failed for api.snapcraft.io."
+  fi
+
+  ls -l "${RESOLV_FILE}"
+  progress_message "True DNS validation passed using configured system resolver."
+}
+
+normalize_host_entries() {
+  step_message 12 "Normalize Solutionz hostname entries"
+
+  local tmp
+  tmp="$(mktemp)"
+  awk '
+    $0 !~ /(^|[[:space:]])solzrmm([[:space:]]|$)/ &&
+    $0 !~ /(^|[[:space:]])solz-rmm([[:space:]]|$)/ {print}
+  ' /etc/hosts > "${tmp}"
+
+  printf '127.0.1.1\tsolz-rmm solzrmm\n' >> "${tmp}"
+  cat "${tmp}" > /etc/hosts
+  rm -f "${tmp}"
+
+  grep -qxF $'127.0.1.1\tsolz-rmm solzrmm' /etc/hosts || \
+    error_exit "Unable to normalize Solutionz hostname entry."
+}
+
+grub_get_value() {
+  local variable="$1"
+  local line
+  line="$(grep -E "^${variable}=" "${GRUB_FILE}" | head -n1 || true)"
+  line="${line#*=}"
+  line="${line#\"}"
+  line="${line%\"}"
+  printf '%s' "${line}"
+}
+
+grub_set_value() {
+  local variable="$1"
+  local value="$2"
+
+  if grep -qE "^${variable}=" "${GRUB_FILE}"; then
+    sed -i -E "s|^${variable}=.*|${variable}=\"${value}\"|" "${GRUB_FILE}"
+  else
+    printf '%s="%s"\n' "${variable}" "${value}" >> "${GRUB_FILE}"
+  fi
+}
+
+append_grub_param() {
+  local variable="$1"
+  local param="$2"
+  local value
+  value="$(grub_get_value "${variable}")"
+
+  if [[ " ${value} " == *" ${param} "* ]]; then
+    progress_message "${variable} already contains ${param}."
+    return 0
+  fi
+
+  value="${value:+${value} }${param}"
+  grub_set_value "${variable}" "${value}"
+  progress_message "Added ${param} to ${variable}."
+}
+
+configure_grub_and_serial() {
+  step_message 13 "Configure interface naming and V1610 USB-C COM console"
+
+  cp -a "${GRUB_FILE}" "${GRUB_FILE}.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+
+  # Keep firmware-provided predictable interface names on V1610.
+  append_grub_param "GRUB_CMDLINE_LINUX_DEFAULT" "console=tty0"
+  append_grub_param "GRUB_CMDLINE_LINUX_DEFAULT" "console=ttyS0,115200n8"
+
+  [[ -c "${SERIAL_DEVICE}" ]] || error_exit "${SERIAL_DEVICE} is not present."
+
+  mkdir -p "${SERIAL_DROPIN_DIR}"
+  cat > "${SERIAL_DROPIN_FILE}" <<'EOF'
+[Service]
+ExecStart=
+ExecStart=-/sbin/agetty -o '-p -- \u' --keep-baud 115200,57600,38400,9600 ttyS0 vt220
+EOF
+
+  systemctl daemon-reload
+  systemctl enable --now "${SERIAL_SERVICE}"
+  systemctl is-enabled "${SERIAL_SERVICE}" >/dev/null 2>&1 || \
+    error_exit "${SERIAL_SERVICE} is not enabled."
+  systemctl is-active "${SERIAL_SERVICE}" >/dev/null 2>&1 || \
+    error_exit "${SERIAL_SERVICE} is not active."
+
+  # The systemd unit state is authoritative for the serial-console acceptance
+  # check. An agetty process may be transient or respawn around login/session
+  # changes, so pgrep is diagnostic only and must not fail the production build.
+  if pgrep -a agetty 2>/dev/null | grep -q 'ttyS0'; then
+    progress_message "agetty process currently visible on ttyS0."
+  else
+    warning_message "No persistent agetty process is currently visible on ttyS0; ${SERIAL_SERVICE} is enabled/active and remains the authoritative check."
+  fi
+
+  update-grub
+  progress_message "V1610 USB-C COM console configured for 115200 8N1."
+}
+
+install_local_serial_config_tool() {
+  step_message 14 "Install USB-C COM direct configuration utility"
+
+  cat > "${LOCAL_CONFIG_TOOL}" <<'LOCALCFG'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+NETPLAN_FILE="/etc/netplan/00-installer-config.yaml"
+
+require_root() {
+  if [[ "${EUID}" -ne 0 ]]; then
+    echo "Run this utility with sudo." >&2
+    exit 1
+  fi
+}
+
+backup_netplan() {
+  if [[ -f "${NETPLAN_FILE}" ]]; then
+    cp -a "${NETPLAN_FILE}" "${NETPLAN_FILE}.serialcfg.bak.$(date -u +%Y%m%dT%H%M%SZ)"
+  fi
+}
+
+validate_ipv4_cidr() {
+  python3 - "$1" <<'PY'
+import ipaddress, sys
+ipaddress.ip_interface(sys.argv[1])
+PY
+}
+
+validate_ipv4_address() {
+  python3 - "$1" <<'PY'
+import ipaddress, sys
+ipaddress.ip_address(sys.argv[1])
+PY
+}
+
+write_dhcp() {
+  backup_netplan
+  cat > "${NETPLAN_FILE}" <<'YAML'
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    eno0:
+      dhcp4: true
+      dhcp6: false
+      accept-ra: false
+    eno1:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      optional: true
+    eno2:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      optional: true
+    eno3:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      optional: true
+    eno4:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      optional: true
+    eno5:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      optional: true
+YAML
+  chmod 600 "${NETPLAN_FILE}"
+}
+
+write_static() {
+  local address gateway dns_input
+  local -a dns_servers
+
+  read -r -p "eno0 IPv4 address with CIDR (example 192.168.10.20/24): " address
+  validate_ipv4_cidr "${address}" || { echo "Invalid IPv4/CIDR."; return 1; }
+
+  read -r -p "Default gateway IPv4 address: " gateway
+  validate_ipv4_address "${gateway}" || { echo "Invalid gateway."; return 1; }
+
+  read -r -p "DNS servers, comma separated (example 192.168.10.1,8.8.8.8): " dns_input
+  IFS=',' read -r -a dns_servers <<< "${dns_input}"
+
+  local dns_yaml=""
+  local dns
+  for dns in "${dns_servers[@]}"; do
+    dns="$(echo "${dns}" | xargs)"
+    [[ -z "${dns}" ]] && continue
+    validate_ipv4_address "${dns}" || { echo "Invalid DNS address: ${dns}"; return 1; }
+    if [[ -n "${dns_yaml}" ]]; then
+      dns_yaml+=", "
+    fi
+    dns_yaml+="${dns}"
+  done
+
+  backup_netplan
+
+  cat > "${NETPLAN_FILE}" <<YAML
+network:
+  version: 2
+  renderer: networkd
+  ethernets:
+    eno0:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      addresses:
+        - ${address}
+      routes:
+        - to: default
+          via: ${gateway}
+YAML
+
+  if [[ -n "${dns_yaml}" ]]; then
+    cat >> "${NETPLAN_FILE}" <<YAML
+      nameservers:
+        addresses: [${dns_yaml}]
+YAML
+  fi
+
+  cat >> "${NETPLAN_FILE}" <<'YAML'
+    eno1:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      optional: true
+    eno2:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      optional: true
+    eno3:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      optional: true
+    eno4:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      optional: true
+    eno5:
+      dhcp4: false
+      dhcp6: false
+      accept-ra: false
+      link-local: []
+      optional: true
+YAML
+
+  chmod 600 "${NETPLAN_FILE}"
+}
+
+show_status() {
+  echo
+  echo "===== Current Interface State ====="
+  ip -br addr || true
+  echo
+  echo "===== Current Routes ====="
+  ip route || true
+  echo
+  echo "===== Current Netplan ====="
+  cat "${NETPLAN_FILE}" 2>/dev/null || true
+  echo
+  echo "===== DNS ====="
+  resolvectl status 2>/dev/null | sed -n '1,80p' || true
+  echo
+}
+
+sync_ufw_to_eno0_subnet() {
+  # Revision 5091126-V1610-LAB2 production policy keeps TCP 22 and TCP 3000 globally
+  # permitted in UFW. Network changes therefore do not require source-subnet
+  # firewall rewrites.
+  return 0
+}
+
+apply_config() {
+  netplan generate
+  echo
+  echo "Proposed Netplan:"
+  cat "${NETPLAN_FILE}"
+  echo
+  read -r -p "Apply this network configuration now? Type 'yes': " answer
+  if [[ "${answer}" != "yes" ]]; then
+    echo "Configuration saved but not applied."
+    return 0
+  fi
+
+  netplan apply
+  sleep 2
+  sync_ufw_to_eno0_subnet
+  show_status
+}
+
+restore_backup() {
+  local latest
+  latest="$(ls -1t "${NETPLAN_FILE}".serialcfg.bak.* 2>/dev/null | head -n1 || true)"
+  if [[ -z "${latest}" ]]; then
+    echo "No serial configuration backup found."
+    return 1
+  fi
+  cp -a "${latest}" "${NETPLAN_FILE}"
+  chmod 600 "${NETPLAN_FILE}"
+  echo "Restored ${latest}"
+  apply_config
+}
+
+require_root
+
+while true; do
+  cat <<'MENU'
+
+Solutionz RMM V1610 USB-C COM Local Configuration
+-------------------------------------------------
+1) Configure eno0 for DHCP
+2) Configure eno0 with a static IPv4 address
+3) Show current network status
+4) Restore most recent serial-console Netplan backup
+5) Exit
+MENU
+
+  read -r -p "Selection: " choice
+  case "${choice}" in
+    1)
+      write_dhcp
+      apply_config
+      ;;
+    2)
+      write_static
+      apply_config
+      ;;
+    3)
+      show_status
+      ;;
+    4)
+      restore_backup
+      ;;
+    5)
+      exit 0
+      ;;
+    *)
+      echo "Invalid selection."
+      ;;
+  esac
+done
+LOCALCFG
+
+  chmod 750 "${LOCAL_CONFIG_TOOL}"
+  chown root:root "${LOCAL_CONFIG_TOOL}"
+
+  cat > "${SERIAL_PROFILE_FILE}" <<EOF
+#!/usr/bin/env bash
+case "\$(tty 2>/dev/null || true)" in
+  /dev/ttyS0)
+    echo
+    echo "Solutionz RMM V1610 USB-C COM console detected."
+    echo "For direct network configuration run:"
+    echo "  sudo ${LOCAL_CONFIG_TOOL}"
+    echo
+    ;;
+esac
+EOF
+  chmod 644 "${SERIAL_PROFILE_FILE}"
+
+  progress_message "Direct laptop configuration is available through the V1610 USB-C COM console."
+}
+
+update_banner() {
+  step_message 15 "Install Solutionz login banner"
+
+  cat > "${MOTD_FILE}" <<'EOF'
+#!/usr/bin/env bash
+echo '
+  _____   ____    _      _    _   _____   _    ____   _     _
+ / ____| / __ \  | |    | |  | | |_   _| | |  / __ \ | \   | |  _____
+| (___  | |  | | | |    | |  | |   | |   | | | |  | ||  \  | | |___ /
+ \___ \ | |  | | | |    | |  | |   | |   | | | |  | || |\ \| |   / /
+ ____) || |__| | | |___ | |__| |   | |   | | | |__| || |  \  |  / /__
+|_____/  \____/  |_____| \____/    |_|   |_|  \____/ |_|   \_| /_____|'
+echo "Welcome to the Solutionz RMM Agent Login."
+echo "============================================================"
+hostnamectl
+echo "------------------------------------------------------------"
+ip -br addr
+echo "------------------------------------------------------------"
+echo "Uptime: $(uptime -p)"
+echo "Kernel: $(uname -r)"
+echo "Memory: $(free -h | awk '/Mem:/ {print $3 "/" $2}')"
+echo "Disk: $(df -h / | awk 'NR==2 {print $3 "/" $2 " used"}')"
+echo "============================================================"
+echo "System information as of $(date)"
+EOF
+
+  chmod 755 "${MOTD_FILE}"
+}
+
+install_postreboot_validation() {
+  step_message 16 "Install post-reboot production validation"
+
+  cat > "${POSTREBOOT_VALIDATOR}" <<'POSTVALIDATOR'
+#!/usr/bin/env bash
+set -uo pipefail
+
+REVISION="5091126-V1610-LAB2"
+SUPPORTED_OS_ID="ubuntu"
+SUPPORTED_UBUNTU_VERSION_ID="24.04"
+SUPPORTED_UBUNTU_CODENAME="noble"
+SUPPORTED_VENDOR="Protectli"
+SUPPORTED_MODEL="V1610"
+
+STATE_FILE="/var/lib/rswsolutionz-rmm/install.state"
+PACKAGE_BASELINE_FILE="/var/lib/rswsolutionz-rmm/package-baseline-5091126-V1610-LAB2.tsv"
+OS_BASELINE_FILE="/var/lib/rswsolutionz-rmm/os-baseline-5091126-V1610-LAB2.txt"
+MANUFACTURER_BASELINE_FILE="/var/lib/rswsolutionz-rmm/manufacturer-baseline-5091126-V1610-LAB2.txt"
+MANUFACTURER_PACKAGE_BASELINE_FILE="/var/lib/rswsolutionz-rmm/manufacturer-packages-5091126-V1610-LAB2.tsv"
+MANUFACTURER_PACKAGE_VALIDATION_FILE="/var/lib/rswsolutionz-rmm/manufacturer-package-validation-5091126-V1610-LAB2.txt"
+MANUFACTURER_BASELINE_SHA256_FILE="/var/lib/rswsolutionz-rmm/manufacturer-baseline-5091126-V1610-LAB2.sha256"
+SNAP_BASELINE_FILE="/var/lib/rswsolutionz-rmm/snap-baseline-5091126-V1610-LAB2.txt"
+NETWORK_REQUIREMENTS_FILE="/var/lib/rswsolutionz-rmm/network-requirements-5091126-V1610-LAB2.txt"
+LOG_DIR="/var/log/solutionz-rmm/setup"
+LOG_FILE="${LOG_DIR}/postreboot-validation.log"
+DOMOTZ_SNAP_NAME="domotzpro-agent-publicstore"
+SERIAL_SERVICE="serial-getty@ttyS0.service"
+SERIAL_DEVICE="/dev/ttyS0"
+LOCAL_CONFIG_TOOL="/usr/local/sbin/solutionz-rmm-local-config"
+NETPLAN_FILE="/etc/netplan/00-installer-config.yaml"
+GRUB_FILE="/etc/default/grub"
+
+REQUIRED_PACKAGES=(
+  net-tools
+  openvswitch-switch
+  traceroute
+  dnsutils
+  curl
+  openssl
+  netcat-openbsd
+  nano
+  iputils-ping
+  ufw
+  snapd
+  openssh-server
+  systemd-timesyncd
+  sudo
+  python3
+)
+
+mkdir -p "${LOG_DIR}"
+exec >> "${LOG_FILE}" 2>&1
+
+status="$(head -n1 "${STATE_FILE}" 2>/dev/null || true)"
+case "${status}" in
+  phase1_complete|phase2_validation_failed)
+    ;;
+  *)
+    exit 0
+    ;;
+esac
+
+echo "============================================================"
+echo "Solutionz RMM production post-reboot validation"
+echo "Revision: ${REVISION}"
+echo "Time: $(date -u +%FT%TZ)"
+echo "============================================================"
+
+failures=0
+warnings=0
+
+pass() { echo "PASS - $*"; }
+warn() { echo "WARN - $*"; warnings=$((warnings + 1)); }
+fail() { echo "FAIL - $*"; failures=$((failures + 1)); }
+
+check() {
+  local description="$1"
+  shift
+  if "$@" >/dev/null 2>&1; then
+    pass "${description}"
+  else
+    fail "${description}"
+  fi
+}
+
+dns_resolves_ipv4() {
+  local host="$1"
+  getent ahostsv4 "${host}" 2>/dev/null | awk '{print $1}' | grep -Eq '^[0-9]+(\.[0-9]+){3}$'
+}
+
+ntp_is_synchronized() {
+  local synced=""
+  synced="$(timedatectl show -p NTPSynchronized --value 2>/dev/null || true)"
+  [[ "${synced}" == "yes" || -e /run/systemd/timesync/synchronized ]]
+}
+
+wait_for_ntp_sync() {
+  local attempts="${1:-36}"
+  local delay_seconds="${2:-5}"
+  local attempt
+
+  for ((attempt=1; attempt<=attempts; attempt++)); do
+    if ntp_is_synchronized; then
+      return 0
+    fi
+    if (( attempt < attempts )); then
+      sleep "${delay_seconds}"
+    fi
+  done
+
+  return 1
+}
+
+report_ntp_diagnostics() {
+  echo "INFO - NTP diagnostics:"
+  timedatectl status 2>/dev/null | sed -n '1,20p' || true
+  timedatectl timesync-status --no-pager 2>/dev/null | sed -n '1,40p' || true
+  systemctl status systemd-timesyncd.service --no-pager -l 2>/dev/null | sed -n '1,40p' || true
+  journalctl -u systemd-timesyncd.service -n 30 --no-pager 2>/dev/null || true
+}
+
+state_value() {
+  local key="$1"
+  awk -F= -v key="${key}" '$1 == key {print substr($0, index($0,"=")+1); exit}' "${STATE_FILE}" 2>/dev/null || true
+}
+
+# Platform baseline: Ubuntu 24.04.3 LTS only.
+if [[ -r /etc/os-release ]]; then
+  # shellcheck disable=SC1091
+  . /etc/os-release
+  [[ "${VERSION:-}" == "24.04.3 LTS (Noble Numbat)" ]] && pass "Approved point release 24.04.3." || fail "Unsupported point release: ${VERSION:-unknown}."
+  [[ "${ID:-}" == "${SUPPORTED_OS_ID}" ]] && pass "Operating system is Ubuntu." || fail "Operating system ID is ${ID:-unknown}; expected Ubuntu."
+  [[ "${VERSION_ID:-}" == "${SUPPORTED_UBUNTU_VERSION_ID}" ]] && pass "Ubuntu LTS family is ${SUPPORTED_UBUNTU_VERSION_ID}." || fail "Ubuntu VERSION_ID is ${VERSION_ID:-unknown}; expected ${SUPPORTED_UBUNTU_VERSION_ID}."
+  if [[ -n "${VERSION_CODENAME:-}" && "${VERSION_CODENAME}" != "${SUPPORTED_UBUNTU_CODENAME}" ]]; then
+    fail "Ubuntu codename is ${VERSION_CODENAME}; expected ${SUPPORTED_UBUNTU_CODENAME}."
+  else
+    pass "Ubuntu runtime release is supported: ${PRETTY_NAME:-${VERSION:-unknown}}"
+  fi
+else
+  fail "/etc/os-release is unavailable."
+fi
+
+vendor="$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null | xargs || true)"
+model="$(cat /sys/class/dmi/id/product_name 2>/dev/null | xargs || true)"
+[[ "${vendor,,}" == *"${SUPPORTED_VENDOR,,}"* ]] && pass "Hardware vendor is Protectli." || fail "Hardware vendor is ${vendor:-unknown}; expected Protectli."
+[[ "${model}" == "${SUPPORTED_MODEL}" ]] && pass "Hardware model is V1610." || fail "Hardware model is ${model:-unknown}; expected V1610."
+
+[[ "$(state_value revision)" == "${REVISION}" ]] && pass "State-file revision matches ${REVISION}." || fail "State-file revision does not match ${REVISION}."
+[[ -s "${PACKAGE_BASELINE_FILE}" ]] && pass "Final required-package baseline record exists." || fail "Final required-package baseline record is missing."
+[[ -s "${OS_BASELINE_FILE}" ]] && pass "Initial OS runtime baseline record exists." || fail "Initial OS runtime baseline record is missing."
+[[ -s "${MANUFACTURER_BASELINE_FILE}" ]] && pass "Manufacturer system baseline record exists." || fail "Manufacturer system baseline record is missing."
+[[ -s "${MANUFACTURER_PACKAGE_BASELINE_FILE}" ]] && pass "Manufacturer package inventory exists." || fail "Manufacturer package inventory is missing."
+[[ -s "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" ]] && pass "Manufacturer required-package validation exists." || fail "Manufacturer required-package validation is missing."
+[[ -s "${MANUFACTURER_BASELINE_SHA256_FILE}" ]] && pass "Manufacturer baseline checksum record exists." || fail "Manufacturer baseline checksum record is missing."
+[[ -s "${NETWORK_REQUIREMENTS_FILE}" ]] && pass "Network requirements record exists." || fail "Network requirements record is missing."
+if [[ -s "${MANUFACTURER_BASELINE_SHA256_FILE}" ]]; then
+  if sha256sum -c "${MANUFACTURER_BASELINE_SHA256_FILE}" >/dev/null 2>&1; then
+    pass "Manufacturer baseline integrity validation passed."
+  else
+    fail "Manufacturer baseline integrity validation failed."
+  fi
+fi
+if [[ -s "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" ]]; then
+  if grep -q '^manufacturer_package_validation=PASS$' "${MANUFACTURER_PACKAGE_VALIDATION_FILE}"; then
+    pass "Manufacturer-delivered required-package set was complete at baseline capture."
+  elif grep -q '^manufacturer_package_validation=DEVIATION$' "${MANUFACTURER_PACKAGE_VALIDATION_FILE}"; then
+    warn "Manufacturer-delivered package baseline had one or more missing required packages; the original deviation is preserved in the baseline report."
+  else
+    fail "Manufacturer required-package validation record does not contain a recognized PASS/DEVIATION result."
+  fi
+fi
+[[ -s "${SNAP_BASELINE_FILE}" ]] && pass "Domotz Snap audit record exists." || fail "Domotz Snap audit record is missing."
+
+for pkg in "${REQUIRED_PACKAGES[@]}"; do
+  if dpkg-query -W -f='${db:Status-Abbrev}' "${pkg}" 2>/dev/null | grep -q '^ii'; then
+    pass "Final required package installed: ${pkg}"
+  else
+    fail "Final required package missing: ${pkg}"
+  fi
+done
+
+validate_v1610_nics() (
+  local i dev iface mac driver count=0
+  local -a slots=(03 04 05 07 08 09)
+  local -A seen=()
+  for dev in /sys/bus/pci/devices/*; do
+    if [[ $(cat "$dev/class" 2>/dev/null) == 0x020000 ]]; then count=$((count+1)); fi
+  done
+  [[ $count == 6 ]] || { echo "Expected six PCI Ethernet controllers; found $count" >&2; exit 1; }
+  for i in "${!slots[@]}"; do
+    iface="eno$i"; dev="/sys/class/net/$iface/device"
+    [[ $(basename "$(readlink -f "$dev")") == "0000:${slots[i]}:00.0" && $(cat "$dev/vendor") == 0x8086 && $(cat "$dev/device") == 0x125c && $(basename "$(readlink -f "$dev/driver")") == igc ]] || { echo "Invalid PCI/controller/driver mapping for $iface" >&2; exit 1; }
+    mac=$(cat "/sys/class/net/$iface/address") || exit 1
+    [[ $mac =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ && $mac != 00:00:00:00:00:00 && -z ${seen[$mac]:-} ]] || exit 1
+    seen[$mac]=1
+    printf '%s | PCI 0000:%s:00.0 | MAC %s | igc\n' "$iface" "${slots[i]}" "$mac"
+  done
+)
+
+# Network baseline
+check "V1610 PCI topology and igc drivers" validate_v1610_nics
+check "eno0 exists" ip link show eno0
+if ip -4 addr show dev eno0 2>/dev/null | grep -q 'inet '; then pass "eno0 has an IPv4 address."; else fail "eno0 has no IPv4 address."; fi
+if ip -4 route show default | grep -q ' dev eno0 '; then pass "Default IPv4 route uses eno0."; else fail "Default IPv4 route does not use eno0."; fi
+for iface in eno1 eno2 eno3 eno4 eno5; do
+  check "$iface exists" ip link show "$iface"
+  if ip -4 route show default | grep -Eq " dev $iface( |$)"; then fail "$iface has an IPv4 default route."; else pass "$iface has no IPv4 default route."; fi
+done
+check "Netplan configuration generates successfully" netplan generate
+[[ -s "${NETPLAN_FILE}" ]] && pass "Solutionz Netplan file exists." || fail "Solutionz Netplan file is missing."
+
+# DNS and time
+if dns_resolves_ipv4 api.snapcraft.io; then pass "DNS resolves api.snapcraft.io to IPv4."; else fail "DNS does not resolve api.snapcraft.io to IPv4."; fi
+if dns_resolves_ipv4 archive.ubuntu.com; then pass "DNS resolves archive.ubuntu.com to IPv4."; else fail "DNS does not resolve archive.ubuntu.com to IPv4."; fi
+if dns_resolves_ipv4 security.ubuntu.com; then pass "DNS resolves security.ubuntu.com to IPv4."; else fail "DNS does not resolve security.ubuntu.com to IPv4."; fi
+
+if command -v timedatectl >/dev/null 2>&1; then
+  if systemctl is-enabled --quiet systemd-timesyncd.service 2>/dev/null; then
+    pass "systemd-timesyncd.service is enabled."
+  else
+    fail "systemd-timesyncd.service is not enabled."
+  fi
+
+  if systemctl is-active --quiet systemd-timesyncd.service; then
+    pass "systemd-timesyncd.service is active."
+  else
+    fail "systemd-timesyncd.service is not active."
+  fi
+
+  if systemctl is-enabled --quiet systemd-time-wait-sync.service 2>/dev/null; then
+    pass "systemd-time-wait-sync.service is enabled for accurate time-sync.target ordering."
+  else
+    fail "systemd-time-wait-sync.service is not enabled."
+  fi
+
+  echo "INFO - Waiting up to 180 seconds for current-boot NTP synchronization evidence."
+  if wait_for_ntp_sync 36 5; then
+    pass "System clock is synchronized to a network time source."
+  else
+    fail "System clock did not synchronize within 180 seconds."
+    report_ntp_diagnostics
+  fi
+else
+  fail "timedatectl is unavailable; NTP synchronization cannot be validated."
+fi
+
+# SSH and firewall
+check "SSH service is active" systemctl is-active --quiet ssh
+check "SSH service is enabled" systemctl is-enabled --quiet ssh
+if ss -lnt 2>/dev/null | awk '$4 ~ /:22$/ {found=1} END {exit found?0:1}'; then pass "TCP 22 is listening locally."; else fail "TCP 22 is not listening locally."; fi
+if ufw status | grep -q 'Status: active'; then pass "UFW is active."; else fail "UFW is not active."; fi
+if ufw status | grep -Eq '^22/tcp[[:space:]]+ALLOW'; then pass "UFW globally permits inbound TCP 22."; else fail "UFW global TCP 22 rule is missing."; fi
+if ufw status | grep -Eq '^3000/tcp[[:space:]]+ALLOW'; then pass "UFW globally permits inbound TCP 3000."; else fail "UFW global TCP 3000 rule is missing."; fi
+if ufw status verbose | grep -Eq '^Default: deny \(incoming\), allow \(outgoing\)'; then pass "UFW default outbound policy is allow."; else fail "UFW default outbound policy is not allow."; fi
+if ss -lnt 2>/dev/null | awk '$4 ~ /:3000$/ {found=1} END {exit found?0:1}'; then pass "TCP 3000 is listening locally."; else warn "TCP 3000 is not currently listening; Domotz local service may require activation/startup state review."; fi
+
+# TUN and Domotz local state
+[[ -c /dev/net/tun ]] && pass "TUN device is available." || fail "TUN device is unavailable."
+if snap list "${DOMOTZ_SNAP_NAME}" >/dev/null 2>&1; then pass "Domotz Snap is installed."; else fail "Domotz Snap is not installed."; fi
+for permission in firewall-control network-observe raw-usb shutdown system-observe; do
+  if snap connections "${DOMOTZ_SNAP_NAME}" 2>/dev/null | awk -v p="${permission}" '$1 == p && $3 != "-" {found=1} END {exit found ? 0 : 1}'; then
+    pass "Domotz permission ${permission} is connected."
+  else
+    fail "Domotz permission ${permission} is not connected."
+  fi
+done
+
+# Serial/COM recovery path
+[[ -c "${SERIAL_DEVICE}" ]] && pass "V1610 ttyS0 serial device is present." || fail "V1610 ttyS0 serial device is missing."
+check "Serial console service is active" systemctl is-active --quiet "${SERIAL_SERVICE}"
+check "Serial console service is enabled" systemctl is-enabled --quiet "${SERIAL_SERVICE}"
+# Do not require a persistent pgrep match for agetty. The systemd serial-getty
+# unit may respawn around login/session changes; enabled+active unit state,
+# ttyS0 presence, and GRUB console configuration are the production criteria.
+[[ -x "${LOCAL_CONFIG_TOOL}" ]] && pass "USB-C COM local configuration utility is installed." || fail "USB-C COM local configuration utility is missing."
+if grep -Eq '(^|[[:space:]"])(net\.ifnames=0|biosdevname=0)([[:space:]"]|$)' /proc/cmdline; then fail "Legacy interface naming is active."; else pass "Predictable interface naming retained."; fi
+if grep -Eq '^GRUB_CMDLINE_LINUX_DEFAULT=.*console=ttyS0,115200n8' "${GRUB_FILE}"; then pass "GRUB serial-console parameter is present."; else fail "GRUB serial-console parameter is missing."; fi
+
+echo "------------------------------------------------------------"
+echo "Production validation failures: ${failures}"
+echo "Production validation warnings: ${warnings}"
+echo "Log: ${LOG_FILE}"
+echo "============================================================"
+
+if (( failures == 0 )); then
+  {
+    echo "phase2_system_validated"
+    echo "revision=${REVISION}"
+    echo "timestamp_utc=$(date -u +%FT%TZ)"
+    echo "failures=0"
+    echo "warnings=${warnings}"
+  } > "${STATE_FILE}"
+  chmod 640 "${STATE_FILE}"
+  echo "POST-REBOOT PRODUCTION VALIDATION PASSED"
+  exit 0
+fi
+
+{
+  echo "phase2_validation_failed"
+  echo "revision=${REVISION}"
+  echo "timestamp_utc=$(date -u +%FT%TZ)"
+  echo "failures=${failures}"
+  echo "warnings=${warnings}"
+} > "${STATE_FILE}"
+chmod 640 "${STATE_FILE}"
+echo "POST-REBOOT PRODUCTION VALIDATION FAILED: ${failures} check(s)"
+exit 1
+POSTVALIDATOR
+
+  chmod 750 "${POSTREBOOT_VALIDATOR}"
+  chown root:root "${POSTREBOOT_VALIDATOR}"
+
+  cat > "${POSTREBOOT_SERVICE}" <<EOF
+[Unit]
+Description=Solutionz RMM Post-Reboot Production Validation
+After=network-online.target systemd-timesyncd.service time-sync.target ssh.service snapd.service
+Wants=network-online.target systemd-timesyncd.service systemd-time-wait-sync.service time-sync.target
+
+[Service]
+Type=oneshot
+ExecStart=${POSTREBOOT_VALIDATOR}
+RemainAfterExit=yes
+TimeoutStartSec=5min
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+  systemctl daemon-reload
+  systemctl enable rswsolutionz-rmm-postreboot-validation.service
+}
+
+check_final_requirement() {
+  local description="$1"
+  shift
+  if "$@"; then
+    printf '%sPASS - %s%s\n' "${COLOR_GREEN}" "${description}" "${COLOR_RESET}"
+    return 0
+  fi
+  printf '%sFAIL - %s%s\n' "${COLOR_RED}" "${description}" "${COLOR_RESET}"
+  return 1
+}
+
+final_summary_check() {
+  step_message 17 "Run mandatory pre-reboot validation"
+
+  local failures=0
+
+  echo
+  echo "============================================================"
+  echo "FINAL PRE-REBOOT VALIDATION - REVISION ${REVISION}"
+  echo "============================================================"
+
+  check_final_requirement "V1610 lab platform and exact point release" lab_platform_gate || failures=$((failures + 1))
+  check_final_requirement "Ubuntu ${SUPPORTED_UBUNTU_VERSION_ID} LTS OS family" \
+    bash -c ". /etc/os-release; [[ \"\$ID\" == ubuntu && \"\$VERSION_ID\" == ${SUPPORTED_UBUNTU_VERSION_ID} && ( -z \"\${VERSION_CODENAME:-}\" || \"\$VERSION_CODENAME\" == ${SUPPORTED_UBUNTU_CODENAME} ) ]]" || failures=$((failures + 1))
+
+  check_final_requirement "V1610 ttyS0 serial device present" test -c "${SERIAL_DEVICE}" || failures=$((failures + 1))
+  check_final_requirement "serial getty active" systemctl is-active --quiet "${SERIAL_SERVICE}" || failures=$((failures + 1))
+  check_final_requirement "serial getty enabled" systemctl is-enabled --quiet "${SERIAL_SERVICE}" || failures=$((failures + 1))
+  check_final_requirement "GRUB serial console configured for ttyS0 at 115200 8N1"     grep -Eq '^GRUB_CMDLINE_LINUX_DEFAULT=.*console=ttyS0,115200n8' "${GRUB_FILE}" || failures=$((failures + 1))
+  check_final_requirement "USB-C COM local config utility installed" test -x "${LOCAL_CONFIG_TOOL}" || failures=$((failures + 1))
+  check_final_requirement "Protectli V1610 hardware" bash -c 'vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null); model=$(cat /sys/class/dmi/id/product_name 2>/dev/null); [[ "${vendor,,}" == *protectli* && "$model" == "V1610" ]]' || failures=$((failures + 1))
+  check_final_requirement "SSH active" systemctl is-active --quiet ssh || failures=$((failures + 1))
+  check_final_requirement "UFW active" bash -c "ufw status | grep -q 'Status: active'" || failures=$((failures + 1))
+  check_final_requirement "UFW globally permits TCP 22" bash -c "ufw status | grep -Eq '^22/tcp[[:space:]]+ALLOW'" || failures=$((failures + 1))
+  check_final_requirement "UFW globally permits TCP 3000" bash -c "ufw status | grep -Eq '^3000/tcp[[:space:]]+ALLOW'" || failures=$((failures + 1))
+  check_final_requirement "DNS resolves api.snapcraft.io to IPv4" dns_resolves_ipv4 api.snapcraft.io || failures=$((failures + 1))
+  check_final_requirement "DNS resolves archive.ubuntu.com to IPv4" dns_resolves_ipv4 archive.ubuntu.com || failures=$((failures + 1))
+  check_final_requirement "systemd-timesyncd enabled" systemctl is-enabled --quiet systemd-timesyncd.service || failures=$((failures + 1))
+  check_final_requirement "systemd-timesyncd active" systemctl is-active --quiet systemd-timesyncd.service || failures=$((failures + 1))
+  check_final_requirement "systemd-time-wait-sync enabled" systemctl is-enabled --quiet systemd-time-wait-sync.service || failures=$((failures + 1))
+  echo "INFO - Waiting up to 180 seconds for NTP synchronization before Phase 1 completion."
+  if ! check_final_requirement "NTP synchronization active" wait_for_ntp_sync 36 5; then
+    failures=$((failures + 1))
+    report_ntp_diagnostics
+  fi
+  check_final_requirement "Initial OS runtime baseline record exists" test -s "${OS_BASELINE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer system baseline record exists" test -s "${MANUFACTURER_BASELINE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer package inventory exists" test -s "${MANUFACTURER_PACKAGE_BASELINE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer required-package validation exists" test -s "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer baseline checksum record exists" test -s "${MANUFACTURER_BASELINE_SHA256_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer baseline integrity is valid" \
+    sha256sum -c "${MANUFACTURER_BASELINE_SHA256_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Manufacturer package validation has a recognized result" \
+    grep -Eq '^manufacturer_package_validation=(PASS|DEVIATION)$' "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" || failures=$((failures + 1))
+  if grep -q '^manufacturer_package_validation=DEVIATION$' "${MANUFACTURER_PACKAGE_VALIDATION_FILE}" 2>/dev/null; then
+    warning_message "Manufacturer package baseline contained a recorded deviation. Final required-package state is validated separately and must pass."
+  fi
+  check_final_requirement "Final required-package baseline record exists" test -s "${BASELINE_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Network requirements record exists" test -s "${NETWORK_REQUIREMENTS_FILE}" || failures=$((failures + 1))
+  check_final_requirement "Netplan generates successfully" netplan generate || failures=$((failures + 1))
+  check_final_requirement "Domotz installed" snap list "${DOMOTZ_SNAP_NAME}" || failures=$((failures + 1))
+  check_final_requirement "Post-reboot production validator installed" test -x "${POSTREBOOT_VALIDATOR}" || failures=$((failures + 1))
+
+  local permission
+  for permission in "${REQUIRED_DOMOTZ_PERMISSIONS[@]}"; do
+    if snap connections "${DOMOTZ_SNAP_NAME}" | awk -v p="${permission}" '
+      $1 == p && $3 != "-" {found=1}
+      END {exit found ? 0 : 1}
+    '; then
+      printf '%sPASS - Domotz permission %s connected%s\n' "${COLOR_GREEN}" "${permission}" "${COLOR_RESET}"
+    else
+      printf '%sFAIL - Domotz permission %s not connected%s\n' "${COLOR_RED}" "${permission}" "${COLOR_RESET}"
+      failures=$((failures + 1))
+    fi
+  done
+
+  progress_message "Domotz is intentionally not revision-pinned; installed revision is recorded for audit."
+
+  echo "------------------------------------------------------------"
+  echo "Pre-reboot mandatory failures: ${failures}"
+  echo "============================================================"
+
+  (( failures == 0 ))
+}
+
+validate_v1610_nics() (
+  local i dev iface mac driver count=0
+  local -a slots=(03 04 05 07 08 09)
+  local -A seen=()
+  for dev in /sys/bus/pci/devices/*; do
+    if [[ $(cat "$dev/class" 2>/dev/null) == 0x020000 ]]; then count=$((count+1)); fi
+  done
+  [[ $count == 6 ]] || { echo "Expected six PCI Ethernet controllers; found $count" >&2; exit 1; }
+  for i in "${!slots[@]}"; do
+    iface="eno$i"; dev="/sys/class/net/$iface/device"
+    [[ $(basename "$(readlink -f "$dev")") == "0000:${slots[i]}:00.0" && $(cat "$dev/vendor") == 0x8086 && $(cat "$dev/device") == 0x125c && $(basename "$(readlink -f "$dev/driver")") == igc ]] || { echo "Invalid PCI/controller/driver mapping for $iface" >&2; exit 1; }
+    mac=$(cat "/sys/class/net/$iface/address") || exit 1
+    [[ $mac =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ && $mac != 00:00:00:00:00:00 && -z ${seen[$mac]:-} ]] || exit 1
+    seen[$mac]=1
+    printf '%s | PCI 0000:%s:00.0 | MAC %s | igc\n' "$iface" "${slots[i]}" "$mac"
+  done
+)
+
+lab_platform_gate() (
+  set +u
+  . /etc/os-release || exit 1
+  if [[ "$ID" != ubuntu || "$VERSION_ID" != 24.04 || "$VERSION_CODENAME" != noble || "$VERSION" != '24.04.3 LTS (Noble Numbat)' ]]; then
+    printf 'INSTALLATION BLOCKED: Unsupported OS: %s; required Ubuntu 24.04.3 LTS.\n' "${PRETTY_NAME:-unknown}" >&2
+    exit 1
+  fi
+  local vendor model n=0 dev
+  vendor=$(cat /sys/class/dmi/id/sys_vendor 2>/dev/null) || exit 1
+  model=$(cat /sys/class/dmi/id/product_name 2>/dev/null) || exit 1
+  [[ "${vendor,,}" == *protectli* && "$model" == V1610 ]] || { echo 'INSTALLATION BLOCKED: expected Protectli V1610.' >&2; exit 1; }
+  validate_v1610_nics || exit 1
+  if grep -Eq '(^|[[:space:]])(net\.ifnames=0|biosdevname=0)([[:space:]]|$)' /proc/cmdline /etc/default/grub /etc/default/grub.d/*.cfg 2>/dev/null; then echo "INSTALLATION BLOCKED: legacy naming parameters present; remove them and reboot first." >&2; exit 1; fi
+  [[ -c /dev/ttyS0 ]] || { echo 'INSTALLATION BLOCKED: ttyS0 missing.' >&2; exit 1; }
+)
+
+main() {
+  parse_args "$@"
+  require_root
+  if ! lab_platform_gate; then exit 1; fi
+  init_logging
+
+  echo "Solutionz RMM Agent build starting."
+  echo "Script: ${SCRIPT_NAME}"
+  echo "Revision: ${REVISION}"
+  echo "Release date: ${RELEASE_DATE}"
+  echo "Log: ${LOG_FILE}"
+
+  backup_previous_state
+  write_state "phase1_in_progress"
+  record_network_requirements
+
+  prompt_confirmation
+  preflight_checks
+  validate_v1610_nics > "${STATE_DIR}/nic-inventory-${REVISION}.txt"
+  chmod 640 "${STATE_DIR}/nic-inventory-${REVISION}.txt"
+  capture_manufacturer_baseline
+  # This lab build does not freeze repositories or disable security updates.
+  install_required_packages
+  verify_required_packages
+  verify_ssh_service
+  configure_time_sync
+  configure_tun
+  ensure_snapd
+  install_domotz
+  configure_domotz_permissions
+  configure_ufw
+  stage_network_config
+  repair_resolv_conf
+  normalize_host_entries
+  configure_grub_and_serial
+  install_local_serial_config_tool
+  update_banner
+  install_postreboot_validation
+
+  if ! final_summary_check; then
+    error_exit "Mandatory pre-reboot validation failed."
+  fi
+
+  write_state "phase1_complete" \
+    "reboot_required=1" \
+    "postreboot_validator=${POSTREBOOT_VALIDATOR}" \
+    "log=${LOG_FILE}"
+
+  echo
+  echo "------------------------------------------------------------"
+  progress_message "Phase 1 completed successfully."
+  progress_message "Completion Time: $(date -u +%FT%TZ)"
+  progress_message "Hostname: $(hostname)"
+  progress_message "Script Revision: ${REVISION}"
+  progress_message "State File: ${STATE_FILE}"
+  progress_message "Log File: ${LOG_FILE}"
+  echo "------------------------------------------------------------"
+  echo "Manual reboot is required."
+  echo "After reboot, systemd will run the post-reboot validation automatically."
+  echo
+  echo "V1610 direct laptop configuration:"
+  echo "  1. Connect the laptop to the V1610 USB-C port labeled COM."
+  echo "  2. Open a serial terminal at 115200 baud, 8 data bits, no parity, 1 stop bit."
+  echo "  3. Log in with an authorized local account."
+  echo "  4. Run: sudo ${LOCAL_CONFIG_TOOL}"
+  echo "Domotz update policy: not revision-pinned; installed revision recorded in ${SNAP_BASELINE_FILE}."
+}
+
+main "$@"
