@@ -2,9 +2,9 @@
 set -Eeuo pipefail
 
 ###############################################################################
-# Script: rswsolutionz_domotz_setup_rev5091126-V1610-LAB4.sh
+# Script: rswsolutionz_domotz_setup_rev5091126-V1610-LAB5.sh
 # Company: Solutionz INC / RSW
-# Revision: 5091126-V1610-LAB4
+# Revision: 5091126-V1610-LAB5
 # Release Date: 2026-09-11
 #
 # Purpose:
@@ -32,8 +32,8 @@ set -Eeuo pipefail
 #     match is diagnostic only and is not a production failure criterion.
 ###############################################################################
 
-REVISION="5091126-V1610-LAB4"
-SCRIPT_NAME="rswsolutionz_domotz_setup_rev5091126-V1610-LAB4.sh"
+REVISION="5091126-V1610-LAB5"
+SCRIPT_NAME="rswsolutionz_domotz_setup_rev5091126-V1610-LAB5.sh"
 RELEASE_DATE="2026-09-11"
 
 SUPPORTED_OS_ID="ubuntu"
@@ -155,7 +155,7 @@ Usage:
 
 Options:
   --non-interactive             Skip the two manual confirmation prompts.
-  --easter-egg                  Display the non-operational 5091126-V1610-LAB4 Easter egg and exit.
+  --easter-egg                  Display the non-operational 5091126-V1610-LAB5 Easter egg and exit.
   -h, --help                    Show this help.
 
 Domotz update model:
@@ -168,7 +168,7 @@ show_easter_egg() {
   printf '%s\n' "${COLOR_CYAN}"
   cat <<'EASTER_EGG'
 ╔══════════════════════════════════════════════════════╗
-║              SOLUTIONZ RMM - REV 5091126-V1610-LAB4            ║
+║              SOLUTIONZ RMM - REV 5091126-V1610-LAB5            ║
 ║                                                      ║
 ║  If you found this, you actually read the script.   ║
 ║  Statistically, that already puts you ahead.        ║
@@ -264,7 +264,7 @@ backup_previous_state() {
 
 record_network_requirements() {
   cat > "${NETWORK_REQUIREMENTS_FILE}" <<'EOF'
-Solutionz RMM Agent Network Requirements - Revision 5091126-V1610-LAB4
+Solutionz RMM Agent Network Requirements - Revision 5091126-V1610-LAB5
 
 Traffic model
 - Monitoring traffic originates from the RMM Agent to monitored AV devices.
@@ -775,7 +775,7 @@ configure_time_sync() {
   systemctl list-unit-files systemd-timesyncd.service >/dev/null 2>&1 || \
     error_exit "systemd-timesyncd.service is unavailable; the required systemd-timesyncd package is not installed correctly."
 
-  # Revision 5091126-V1610-LAB4 standardizes Ubuntu time synchronization on
+  # Revision 5091126-V1610-LAB5 standardizes Ubuntu time synchronization on
   # systemd-timesyncd. timedatectl enables network time, while the explicit
   # service commands make the runtime/startup state deterministic.
   timedatectl set-ntp true >/dev/null 2>&1 || \
@@ -918,49 +918,80 @@ install_v1610_nic_naming() {
   cat > /usr/local/sbin/solutionz-v1610-nic-naming <<'NICNAMING'
 #!/usr/bin/env bash
 set -Eeuo pipefail
-# This helper runs at boot before networkd, not during a live Setup session.
+# V1610 PCI-slot-to-eth mapping. Missing secondary NICs never block WAN startup.
+# Hardware inventory failure is reported separately by Phase 2 validation.
 slots=(03 04 05 07 08 09)
-declare -a names macs
-declare -A seen
+declare -a names macs available
+missing=0
+bad=0
+declare -A seen=()
 shopt -s nullglob
 for i in "${!slots[@]}"; do
   pci="/sys/bus/pci/devices/0000:${slots[i]}:00.0"
   links=("$pci"/net/*)
-  [[ ${#links[@]} == 1 && $(cat "$pci/vendor") == 0x8086 && $(cat "$pci/device") == 0x125c && $(basename "$(readlink -f "$pci/driver")") == igc ]] || { echo "Invalid PCI NIC at ${slots[i]}" >&2; exit 1; }
+  if [[ ${#links[@]} != 1 || ! -r "$pci/vendor" || ! -r "$pci/device" || \
+        $(cat "$pci/vendor" 2>/dev/null) != 0x8086 || \
+        $(cat "$pci/device" 2>/dev/null) != 0x125c || \
+        $(basename "$(readlink -f "$pci/driver")") != igc ]]; then
+    echo "WARN - Missing or invalid PCI NIC at ${slots[i]}:00.0 (expected eth$i)" >&2
+    missing=$((missing+1))
+    continue
+  fi
   names[i]=${links[0]##*/}
   macs[i]=$(cat "/sys/class/net/${names[i]}/address")
-  [[ ${macs[i]} =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ && ${macs[i]} != 00:00:00:00:00:00 && -z ${seen[${macs[i]}]:-} ]] || { echo "Invalid or duplicate MAC" >&2; exit 1; }
+  if [[ ! ${macs[i]} =~ ^([[:xdigit:]]{2}:){5}[[:xdigit:]]{2}$ || \
+        ${macs[i]} == 00:00:00:00:00:00 || -n ${seen[${macs[i]}]:-} ]]; then
+    echo "ERROR - Invalid or duplicate MAC for PCI ${slots[i]}:00.0" >&2
+    bad=$((bad+1))
+    continue
+  fi
   seen[${macs[i]}]=1
+  available+=("$i")
   printf '%s -> eth%s | PCI %s | %s\n' "${names[i]}" "$i" "${slots[i]}" "${macs[i]}"
 done
-[[ ${1:-} != --check ]] || exit 0
-# Refuse to run manually after network management has started.
-if systemctl is-active --quiet systemd-networkd.service || systemctl is-active --quiet NetworkManager.service; then
-  echo 'Refusing live NIC rename while network management is active.' >&2; exit 1
+if [[ ${1:-} == --check ]]; then
+  [[ $missing == 0 && $bad == 0 && ${#available[@]} == 6 ]] || exit 1
+  exit 0
 fi
-# All destination names must be unoccupied or belong to one of the six PCI NICs.
-for i in "${!slots[@]}"; do
-  [[ ! -e /sys/class/net/rmmstage$i ]] || { echo "Temporary name collision rmmstage$i" >&2; exit 1; }
+# Do not risk a live rename after the network stack is in use.
+if systemctl is-active --quiet systemd-networkd.service || systemctl is-active --quiet NetworkManager.service; then
+  echo 'ERROR - Refusing live NIC rename while network management is active.' >&2
+  exit 1
+fi
+# A failed secondary NIC must never prevent the surviving WAN NIC from being named.
+# Check for collisions before touching ANY interface.
+for i in "${available[@]}"; do
+  [[ ! -e /sys/class/net/rmmstage$i ]] || { echo "ERROR - Temporary name collision rmmstage$i" >&2; exit 1; }
   if [[ -e /sys/class/net/eth$i ]]; then
-    found=0
-    for n in "${names[@]}"; do [[ $n != eth$i ]] || found=1; done
-    [[ $found == 1 ]] || { echo "Destination name collision eth$i" >&2; exit 1; }
+    owns=0
+    for j in "${available[@]}"; do
+      [[ ${names[j]} != eth$i ]] || owns=1
+    done
+    [[ $owns == 1 ]] || { echo "ERROR - Destination collision eth$i" >&2; exit 1; }
   fi
 done
-already=1
-for i in "${!slots[@]}"; do [[ ${names[i]} == eth$i ]] || already=0; done
-[[ $already == 0 ]] || exit 0
-# Vacate every target name first, avoiding eth-to-eth swaps and kernel naming races.
-for i in "${!slots[@]}"; do
-  ip link set dev "${names[i]}" down
-  ip link set dev "${names[i]}" name "rmmstage$i"
+# Stage only interfaces needing renaming and vacate target names before assignment.
+changes=0
+for i in "${available[@]}"; do
+  [[ ${names[i]} == eth$i ]] || changes=1
 done
-for i in "${!slots[@]}"; do
-  ip link set dev "rmmstage$i" name "eth$i"
+if [[ $changes == 1 ]]; then
+  for i in "${available[@]}"; do
+    ip link set dev "${names[i]}" down
+    ip link set dev "${names[i]}" name "rmmstage$i"
+  done
+  for i in "${available[@]}"; do
+    ip link set dev "rmmstage$i" name "eth$i"
+  done
+fi
+for i in "${available[@]}"; do
+  [[ $(basename "$(readlink -f "/sys/class/net/eth$i/device")") == "0000:${slots[i]}:00.0" && \
+     $(cat "/sys/class/net/eth$i/address") == "${macs[i]}" ]] || \
+     { echo "ERROR - Final mapping mismatch for eth$i" >&2; exit 1; }
 done
-for i in "${!slots[@]}"; do
-  [[ $(basename "$(readlink -f "/sys/class/net/eth$i/device")") == "0000:${slots[i]}:00.0" && $(cat "/sys/class/net/eth$i/address") == "${macs[i]}" ]] || { echo "Final NIC mapping mismatch: eth$i" >&2; exit 1; }
-done
+if ((missing > 0 || bad > 0)); then
+  echo "WARN - Incomplete V1610 hardware inventory: ${#available[@]} of six NICs. Network startup continues; hardware acceptance must FAIL." >&2
+fi
 NICNAMING
   chmod 750 /usr/local/sbin/solutionz-v1610-nic-naming
   chown root:root /usr/local/sbin/solutionz-v1610-nic-naming
@@ -983,11 +1014,11 @@ NICUNIT
   mkdir -p /etc/systemd/system/systemd-networkd.service.d
   cat > /etc/systemd/system/systemd-networkd.service.d/20-solutionz-v1610-nic-naming.conf <<'NICDROPIN'
 [Unit]
-Requires=solutionz-v1610-nic-naming.service
+Wants=solutionz-v1610-nic-naming.service
 After=solutionz-v1610-nic-naming.service
 NICDROPIN
   systemctl daemon-reload
-  progress_message "NIC naming service staged; backup: $backup. Reboot only with working local or serial console access."
+  progress_message "NIC naming service staged (non-blocking on missing NICs); backup: $backup. Reboot only with working local or serial console access."
 }
 
 write_netplan_config() {
@@ -1381,7 +1412,7 @@ show_status() {
 }
 
 sync_ufw_to_eth0_subnet() {
-  # Revision 5091126-V1610-LAB4 production policy keeps TCP 22 and TCP 3000 globally
+  # Revision 5091126-V1610-LAB5 production policy keeps TCP 22 and TCP 3000 globally
   # permitted in UFW. Network changes therefore do not require source-subnet
   # firewall rewrites.
   return 0
@@ -1517,7 +1548,7 @@ install_postreboot_validation() {
 #!/usr/bin/env bash
 set -uo pipefail
 
-REVISION="5091126-V1610-LAB4"
+REVISION="5091126-V1610-LAB5"
 SUPPORTED_OS_ID="ubuntu"
 SUPPORTED_UBUNTU_VERSION_ID="24.04"
 SUPPORTED_UBUNTU_CODENAME="noble"
@@ -1525,14 +1556,14 @@ SUPPORTED_VENDOR="Protectli"
 SUPPORTED_MODEL="V1610"
 
 STATE_FILE="/var/lib/rswsolutionz-rmm/install.state"
-PACKAGE_BASELINE_FILE="/var/lib/rswsolutionz-rmm/package-baseline-5091126-V1610-LAB4.tsv"
-OS_BASELINE_FILE="/var/lib/rswsolutionz-rmm/os-baseline-5091126-V1610-LAB4.txt"
-MANUFACTURER_BASELINE_FILE="/var/lib/rswsolutionz-rmm/manufacturer-baseline-5091126-V1610-LAB4.txt"
-MANUFACTURER_PACKAGE_BASELINE_FILE="/var/lib/rswsolutionz-rmm/manufacturer-packages-5091126-V1610-LAB4.tsv"
-MANUFACTURER_PACKAGE_VALIDATION_FILE="/var/lib/rswsolutionz-rmm/manufacturer-package-validation-5091126-V1610-LAB4.txt"
-MANUFACTURER_BASELINE_SHA256_FILE="/var/lib/rswsolutionz-rmm/manufacturer-baseline-5091126-V1610-LAB4.sha256"
-SNAP_BASELINE_FILE="/var/lib/rswsolutionz-rmm/snap-baseline-5091126-V1610-LAB4.txt"
-NETWORK_REQUIREMENTS_FILE="/var/lib/rswsolutionz-rmm/network-requirements-5091126-V1610-LAB4.txt"
+PACKAGE_BASELINE_FILE="/var/lib/rswsolutionz-rmm/package-baseline-5091126-V1610-LAB5.tsv"
+OS_BASELINE_FILE="/var/lib/rswsolutionz-rmm/os-baseline-5091126-V1610-LAB5.txt"
+MANUFACTURER_BASELINE_FILE="/var/lib/rswsolutionz-rmm/manufacturer-baseline-5091126-V1610-LAB5.txt"
+MANUFACTURER_PACKAGE_BASELINE_FILE="/var/lib/rswsolutionz-rmm/manufacturer-packages-5091126-V1610-LAB5.tsv"
+MANUFACTURER_PACKAGE_VALIDATION_FILE="/var/lib/rswsolutionz-rmm/manufacturer-package-validation-5091126-V1610-LAB5.txt"
+MANUFACTURER_BASELINE_SHA256_FILE="/var/lib/rswsolutionz-rmm/manufacturer-baseline-5091126-V1610-LAB5.sha256"
+SNAP_BASELINE_FILE="/var/lib/rswsolutionz-rmm/snap-baseline-5091126-V1610-LAB5.txt"
+NETWORK_REQUIREMENTS_FILE="/var/lib/rswsolutionz-rmm/network-requirements-5091126-V1610-LAB5.txt"
 LOG_DIR="/var/log/solutionz-rmm/setup"
 LOG_FILE="${LOG_DIR}/postreboot-validation.log"
 DOMOTZ_SNAP_NAME="domotzpro-agent-publicstore"
